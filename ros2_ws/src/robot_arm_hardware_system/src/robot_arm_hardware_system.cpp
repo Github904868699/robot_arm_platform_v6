@@ -227,6 +227,25 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_activate(
 
   for (size_t i = 0; i < synced.size(); ++i) {
     const auto * route = router_.route_for(joint_names_[i]);
+    if (route && route->driver == "hightorque_canfd" &&
+      (!synced[i].available || !synced[i].online || !std::isfinite(synced[i].position)))
+    {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("RobotArmHardwareSystem"),
+        "on_activate: reject due to invalid initial HighTorque sample joint=%s online=%s available=%s pos=%.6f source=%s last_error=%s",
+        joint_names_[i].c_str(),
+        synced[i].online ? "true" : "false",
+        synced[i].available ? "true" : "false",
+        synced[i].position,
+        synced[i].source.c_str(),
+        synced[i].last_error.c_str());
+      runtime_state_ = RuntimeState::FAULT;
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+  }
+
+  for (size_t i = 0; i < synced.size(); ++i) {
+    const auto * route = router_.route_for(joint_names_[i]);
     hw_positions_[i] = backend_position_to_ros(route, synced[i].position);
     hw_velocities_[i] = backend_velocity_to_ros(route, synced[i].velocity);
     hw_commands_[i] = hw_positions_[i];
@@ -397,6 +416,13 @@ bool RobotArmHardwareSystem::request_enable()
     return false;
   }
 
+  if (!check_enable_safety_samples(3, 30)) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("RobotArmHardwareSystem"),
+      "request_enable: rejected due to invalid/unstable HighTorque samples");
+    return false;
+  }
+
   runtime_state_ = RuntimeState::ARMING;
   set_hold_targets_from_current();  // seed backend command buffer from current readings for MIT2 hold.
 
@@ -417,6 +443,51 @@ bool RobotArmHardwareSystem::request_enable()
     enabled_ ? "true" : "false",
     runtime_state_name(runtime_state_));
   return true;
+}
+
+bool RobotArmHardwareSystem::check_enable_safety_samples(size_t consecutive_required, int sleep_ms)
+{
+  if (!backend_) {
+    return false;
+  }
+  size_t stable_ok = 0;
+  for (size_t attempt = 1; attempt <= consecutive_required * 4; ++attempt) {
+    std::vector<JointState> states;
+    if (!backend_->read_all_joint_states(states) || states.size() != joint_names_.size()) {
+      stable_ok = 0;
+    } else {
+      bool all_hightorque_ok = true;
+      for (size_t i = 0; i < states.size(); ++i) {
+        const auto * route = router_.route_for(joint_names_[i]);
+        if (!route || route->driver != "hightorque_canfd") {
+          continue;
+        }
+        const bool ok =
+          states[i].available && states[i].online && !states[i].stale && std::isfinite(states[i].position);
+        if (!ok) {
+          all_hightorque_ok = false;
+          RCLCPP_WARN(
+            rclcpp::get_logger("RobotArmHardwareSystem"),
+            "request_enable: safety sample invalid attempt=%zu/%zu joint=%s online=%s available=%s stale=%s pos=%.6f source=%s last_error=%s",
+            attempt,
+            consecutive_required * 4,
+            joint_names_[i].c_str(),
+            states[i].online ? "true" : "false",
+            states[i].available ? "true" : "false",
+            states[i].stale ? "true" : "false",
+            states[i].position,
+            states[i].source.c_str(),
+            states[i].last_error.c_str());
+        }
+      }
+      stable_ok = all_hightorque_ok ? (stable_ok + 1) : 0;
+      if (stable_ok >= consecutive_required) {
+        return true;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+  }
+  return false;
 }
 
 bool RobotArmHardwareSystem::request_disable()

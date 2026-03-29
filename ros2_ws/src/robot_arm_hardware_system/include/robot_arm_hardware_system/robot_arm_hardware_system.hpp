@@ -68,6 +68,7 @@ private:
   void teardown_backend_services();
   void spin_backend_services();
   void set_hold_targets_from_current();
+  bool check_enable_safety_samples(size_t consecutive_required, int sleep_ms);
   bool load_routing();
 
   // Upper layers only see logical joints: joint_1 ~ joint_6.
