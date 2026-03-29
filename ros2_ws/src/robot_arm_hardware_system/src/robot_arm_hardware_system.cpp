@@ -135,6 +135,12 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_init(
   } else {
     auto_enable_delay_sec_ = 1.0;
   }
+  if (info_.hardware_parameters.count("enable_min_stable_cycles")) {
+    enable_min_stable_cycles_ = std::max(1, std::stoi(info_.hardware_parameters.at("enable_min_stable_cycles")));
+  }
+  if (info_.hardware_parameters.count("enable_wait_timeout_ms")) {
+    enable_wait_timeout_ms_ = std::max(100, std::stoi(info_.hardware_parameters.at("enable_wait_timeout_ms")));
+  }
 
   hw_positions_.assign(joint_names_.size(), 0.0);
   hw_velocities_.assign(joint_names_.size(), 0.0);
@@ -151,9 +157,11 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_init(
     joint_names_.size());
   RCLCPP_INFO(
     rclcpp::get_logger("RobotArmHardwareSystem"),
-    "on_init: auto_enable_on_activate=%s auto_enable_delay_sec=%.3f",
+    "on_init: auto_enable_on_activate=%s auto_enable_delay_sec=%.3f enable_min_stable_cycles=%d enable_wait_timeout_ms=%d",
     auto_enable_on_activate_ ? "true" : "false",
-    auto_enable_delay_sec_);
+    auto_enable_delay_sec_,
+    enable_min_stable_cycles_,
+    enable_wait_timeout_ms_);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -396,6 +404,12 @@ bool RobotArmHardwareSystem::request_enable()
       runtime_state_name(runtime_state_));
     return false;
   }
+  if (!wait_for_stable_samples_before_enable()) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("RobotArmHardwareSystem"),
+      "request_enable: rejected because stable valid joint samples are not ready");
+    return false;
+  }
 
   runtime_state_ = RuntimeState::ARMING;
   set_hold_targets_from_current();  // seed backend command buffer from current readings for MIT2 hold.
@@ -417,6 +431,54 @@ bool RobotArmHardwareSystem::request_enable()
     enabled_ ? "true" : "false",
     runtime_state_name(runtime_state_));
   return true;
+}
+
+bool RobotArmHardwareSystem::wait_for_stable_samples_before_enable()
+{
+  if (!backend_) {
+    return false;
+  }
+  std::vector<int> stable_cycles(joint_names_.size(), 0);
+  const auto t_begin = std::chrono::steady_clock::now();
+  while (true) {
+    std::vector<JointState> states;
+    if (!backend_->read_all_joint_states(states) || states.size() != joint_names_.size()) {
+      return false;
+    }
+
+    for (size_t i = 0; i < states.size(); ++i) {
+      const bool valid =
+        states[i].available && states[i].online && !states[i].stale &&
+        std::isfinite(states[i].position) && std::isfinite(states[i].velocity);
+      stable_cycles[i] = valid ? (stable_cycles[i] + 1) : 0;
+    }
+
+    bool all_ready = true;
+    for (const int c : stable_cycles) {
+      if (c < enable_min_stable_cycles_) {
+        all_ready = false;
+        break;
+      }
+    }
+    if (all_ready) {
+      RCLCPP_INFO(
+        rclcpp::get_logger("RobotArmHardwareSystem"),
+        "enable gate passed: each joint has >=%d consecutive valid samples",
+        enable_min_stable_cycles_);
+      return true;
+    }
+
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t_begin).count();
+    if (elapsed_ms >= enable_wait_timeout_ms_) {
+      RCLCPP_WARN(
+        rclcpp::get_logger("RobotArmHardwareSystem"),
+        "enable gate timeout: waited %ldms but stable samples not ready",
+        static_cast<long>(elapsed_ms));
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
 }
 
 bool RobotArmHardwareSystem::request_disable()

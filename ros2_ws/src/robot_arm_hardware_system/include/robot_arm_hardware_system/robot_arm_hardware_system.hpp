@@ -68,6 +68,7 @@ private:
   void teardown_backend_services();
   void spin_backend_services();
   void set_hold_targets_from_current();
+  bool wait_for_stable_samples_before_enable();
   bool load_routing();
 
   // Upper layers only see logical joints: joint_1 ~ joint_6.
@@ -87,6 +88,8 @@ private:
   std::string joint_mapping_path_{};
   bool auto_enable_on_activate_{false};
   double auto_enable_delay_sec_{1.0};
+  int enable_min_stable_cycles_{3};
+  int enable_wait_timeout_ms_{1500};
 
   rclcpp::Node::SharedPtr backend_service_node_;
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> backend_service_executor_;

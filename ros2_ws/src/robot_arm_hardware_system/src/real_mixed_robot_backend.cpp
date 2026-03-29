@@ -123,6 +123,15 @@ bool is_hightorque_bridge_ack(const std::string & raw)
   return is_hex(token[1]) && token[2] == '0' && token[3] == '0' && token[4] == '0';
 }
 
+uint8_t hightorque_node_id_from_can_id(uint32_t can_id)
+{
+  const uint8_t node_hi = static_cast<uint8_t>((can_id >> 8) & 0xFFu);
+  if (node_hi != 0) {
+    return node_hi;
+  }
+  return static_cast<uint8_t>(can_id & 0xFFu);
+}
+
 std::string to_hex_upper(uint32_t value, int width)
 {
   std::ostringstream oss;
@@ -302,14 +311,9 @@ std::string build_slcan_D_frame(uint32_t can_id, const std::vector<uint8_t> & da
 
 std::string build_hightorque_read_query(const JointRoute & route)
 {
-  // HighTorque CAN-FD read command family uses `D...` (verified manually).
-  // Use full CAN-FD bridge frame style (DLC=A => 16-byte payload),
-  // aligned with manually verified successful D... framing characteristics.
-  // Minimal state-read core payload: 0x01 0x00 0x00 0x14 0x04 0x00 0x11 0x0F
-  // then pad/fill to 16 bytes with 0x50 0x50 tail marker.
+  // Official H730 read_motor_state_int32: payload={0x18,0x04,0x00,0x11,0x0F}.
   const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-  return build_slcan_D_frame(
-    can_id, {0x01, 0x00, 0x00, 0x14, 0x04, 0x00, 0x11, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x50});
+  return build_slcan_D_frame(can_id, {0x18, 0x04, 0x00, 0x11, 0x0F});
 }
 
 std::string build_hightorque_full_status_query(const JointRoute & route)
@@ -371,24 +375,82 @@ bool parse_hightorque_full_status(
   std::string & reason,
   uint32_t & can_id_out)
 {
-  std::vector<uint8_t> payload;
-  if (!parse_slcan_D_payload(raw, payload, can_id_out, reason)) {
+  std::vector<std::pair<uint32_t, std::vector<uint8_t>>> frames;
+  {
+    size_t cursor = 0;
+    while (cursor < raw.size()) {
+      const size_t d_pos = raw.find_first_of("DdBb", cursor);
+      if (d_pos == std::string::npos) {
+        break;
+      }
+      const bool is_extended = (raw[d_pos] == 'D' || raw[d_pos] == 'B');
+      const bool is_canfd = (raw[d_pos] == 'D' || raw[d_pos] == 'd');
+      const size_t can_id_hex_len = is_extended ? 8 : 3;
+      if (!is_canfd || d_pos + 1 + can_id_hex_len + 1 > raw.size()) {
+        cursor = d_pos + 1;
+        continue;
+      }
+      try {
+        const uint32_t parsed_can_id = static_cast<uint32_t>(
+          std::stoul(raw.substr(d_pos + 1, can_id_hex_len), nullptr, 16));
+        const unsigned int dlc_code = static_cast<unsigned int>(
+          std::stoul(raw.substr(d_pos + 1 + can_id_hex_len, 1), nullptr, 16) & 0x0Fu);
+        const size_t payload_len = [] (unsigned int dlc) -> size_t {
+            switch (dlc & 0x0Fu) {
+              case 0x0: return 0;
+              case 0x1: return 1;
+              case 0x2: return 2;
+              case 0x3: return 3;
+              case 0x4: return 4;
+              case 0x5: return 5;
+              case 0x6: return 6;
+              case 0x7: return 7;
+              case 0x8: return 8;
+              case 0x9: return 12;
+              case 0xA: return 16;
+              case 0xB: return 20;
+              case 0xC: return 24;
+              case 0xD: return 32;
+              case 0xE: return 48;
+              case 0xF: return 64;
+              default: return 0;
+            }
+          }(dlc_code);
+        const size_t payload_hex_pos = d_pos + 1 + can_id_hex_len + 1;
+        const size_t need_len = payload_hex_pos + payload_len * 2;
+        if (need_len > raw.size()) {
+          cursor = d_pos + 1;
+          continue;
+        }
+        std::vector<uint8_t> payload;
+        payload.reserve(payload_len);
+        for (size_t i = 0; i < payload_len; ++i) {
+          payload.push_back(static_cast<uint8_t>(
+            std::stoul(raw.substr(payload_hex_pos + i * 2, 2), nullptr, 16) & 0xFFu));
+        }
+        frames.emplace_back(parsed_can_id, std::move(payload));
+        cursor = need_len;
+      } catch (...) {
+        cursor = d_pos + 1;
+      }
+    }
+  }
+  if (frames.empty()) {
+    reason = "short_reply";
     return false;
   }
 
-  const auto le_i16 = [&](size_t off) -> int16_t {
-      return static_cast<int16_t>(
-        static_cast<uint16_t>(payload[off]) |
-        (static_cast<uint16_t>(payload[off + 1]) << 8));
+  const auto le_i16 = [&](const std::vector<uint8_t> & payload, size_t off) -> int16_t {
+      return static_cast<int16_t>(static_cast<uint16_t>(payload[off]) | (static_cast<uint16_t>(payload[off + 1]) << 8));
     };
-  const auto le_i32 = [&](size_t off) -> int32_t {
+  const auto le_i32 = [&](const std::vector<uint8_t> & payload, size_t off) -> int32_t {
       return static_cast<int32_t>(
         static_cast<uint32_t>(payload[off]) |
         (static_cast<uint32_t>(payload[off + 1]) << 8) |
         (static_cast<uint32_t>(payload[off + 2]) << 16) |
         (static_cast<uint32_t>(payload[off + 3]) << 24));
     };
-  const auto le_f32 = [&](size_t off) -> float {
+  const auto le_f32 = [&](const std::vector<uint8_t> & payload, size_t off) -> float {
       uint32_t u =
         static_cast<uint32_t>(payload[off]) |
         (static_cast<uint32_t>(payload[off + 1]) << 8) |
@@ -403,58 +465,50 @@ bool parse_hightorque_full_status(
   // [0]=0x24 [1]=0x04 [2]=0x00 [3]=mode
   // [5:7]=pos_i16_le /10000, [7:9]=vel_i16_le /4000
   // [11]=0x21 [12]=0x0F [13]=fault
-  if (
-    payload.size() >= 14 &&
-    payload[0] == 0x24 && payload[1] == 0x04 && payload[2] == 0x00 &&
-    payload[11] == 0x21 && payload[12] == 0x0F)
-  {
-    const int16_t pos_i16 = le_i16(5);
-    const int16_t vel_i16 = le_i16(7);
-    pos_out = static_cast<double>(pos_i16) / 10000.0;
-    vel_out = static_cast<double>(vel_i16) / 4000.0;
-    reason = "parsed_ok_tint16";
-    return true;
-  }
-
-  // TINT32 variant:
-  // [0]=0x28 [1]=0x04 [2]=0x00 [3]=mode
-  // [7:11]=pos_i32_le /100000, [11:15]=vel_i32_le /100000
-  // [19]=0x21 [20]=0x0F [21]=fault
-  if (
-    payload.size() >= 22 &&
-    payload[0] == 0x28 && payload[1] == 0x04 && payload[2] == 0x00 &&
-    payload[19] == 0x21 && payload[20] == 0x0F)
-  {
-    const int32_t pos_i32 = le_i32(7);
-    const int32_t vel_i32 = le_i32(11);
-    pos_out = static_cast<double>(pos_i32) / 100000.0;
-    vel_out = static_cast<double>(vel_i32) / 100000.0;
-    reason = "parsed_ok_tint32";
-    return true;
-  }
-
-  // TFLOAT variant:
-  // [0]=0x2C [1]=0x04 [2]=0x00 [3]=mode
-  // [7:11]=pos_f32_le turns, [11:15]=vel_f32_le rps
-  // [19]=0x21 [20]=0x0F [21]=fault
-  if (
-    payload.size() >= 22 &&
-    payload[0] == 0x2C && payload[1] == 0x04 && payload[2] == 0x00 &&
-    payload[19] == 0x21 && payload[20] == 0x0F)
-  {
-    const float pos_f32 = le_f32(7);
-    const float vel_f32 = le_f32(11);
-    if (std::isfinite(pos_f32) && std::isfinite(vel_f32)) {
-      pos_out = static_cast<double>(pos_f32);
-      vel_out = static_cast<double>(vel_f32);
-      reason = "parsed_ok_tfloat";
+  for (const auto & frame : frames) {
+    const auto & payload = frame.second;
+    can_id_out = frame.first;
+    if (
+      payload.size() >= 14 &&
+      payload[0] == 0x24 && payload[1] == 0x04 && payload[2] == 0x00 &&
+      payload[11] == 0x21 && payload[12] == 0x0F)
+    {
+      const int16_t pos_i16 = le_i16(payload, 5);
+      const int16_t vel_i16 = le_i16(payload, 7);
+      pos_out = static_cast<double>(pos_i16) / 10000.0;
+      vel_out = static_cast<double>(vel_i16) / 4000.0;
+      reason = "parsed_ok_tint16";
       return true;
     }
-    reason = "non_finite_tfloat";
-    return false;
+    if (
+      payload.size() >= 22 &&
+      payload[0] == 0x28 && payload[1] == 0x04 && payload[2] == 0x00 &&
+      payload[19] == 0x21 && payload[20] == 0x0F)
+    {
+      const int32_t pos_i32 = le_i32(payload, 7);
+      const int32_t vel_i32 = le_i32(payload, 11);
+      pos_out = static_cast<double>(pos_i32) / 100000.0;
+      vel_out = static_cast<double>(vel_i32) / 100000.0;
+      reason = "parsed_ok_tint32";
+      return true;
+    }
+    if (
+      payload.size() >= 22 &&
+      payload[0] == 0x2C && payload[1] == 0x04 && payload[2] == 0x00 &&
+      payload[19] == 0x21 && payload[20] == 0x0F)
+    {
+      const float pos_f32 = le_f32(payload, 7);
+      const float vel_f32 = le_f32(payload, 11);
+      if (std::isfinite(pos_f32) && std::isfinite(vel_f32)) {
+        pos_out = static_cast<double>(pos_f32);
+        vel_out = static_cast<double>(vel_f32);
+        reason = "parsed_ok_tfloat";
+        return true;
+      }
+    }
   }
 
-  reason = "unknown_hightorque_payload_format";
+  reason = "unknown_hightorque_payload_format_or_ack_only";
   return false;
 }
 
@@ -710,15 +764,13 @@ struct LegacyProtocolDeviceActions final
   // NOTE: currently not wired into write path; kept to define action boundary.
   static std::string hightorque_stop(const JointRoute & route)
   {
-    const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-    return build_slcan_D_frame(can_id, {0x01, 0x00, 0x00, 0x14, 0x04, 0x00, 0x11, 0x0F});
+    return build_hightorque_stop_int32(route);
   }
 
   // NOTE: currently not wired into write path; kept to define action boundary.
   static std::string hightorque_brake(const JointRoute & route)
   {
-    const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-    return build_slcan_D_frame(can_id, {0x01, 0x00, 0x0F, 0x14, 0x04, 0x00, 0x11, 0x0F});
+    return build_hightorque_brake_int32(route);
   }
 
   // NOTE: currently not wired into write path; kept to define action boundary.
@@ -1444,7 +1496,9 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
       raw.size(),
       hex_digest(raw).c_str(),
       ascii_escaped(raw).c_str());
-    const std::string full_status_query = LegacyProtocolDeviceActions::hightorque_query_full_status(route);
+    // Official read path already uses read_motor_state_int32 query frame.
+    // If bridge returns short ACK only, retry the same official query once.
+    const std::string full_status_query = LegacyProtocolDeviceActions::hightorque_query(route);
     RCLCPP_INFO(
       rclcpp::get_logger("RealMixedRobotBackend"),
       "[Hightorque] full_status_query tx ascii_escaped='%s' tx_hex=%s tx_len=%zu",
@@ -1496,13 +1550,36 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
     return true;
   }
 
+  const uint8_t parsed_node_id = hightorque_node_id_from_can_id(parsed_can_id);
+  if (parsed_node_id == 0) {
+    ++parse_failures;
+    RCLCPP_WARN(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "[Hightorque] classify=node_reject reason=node_id_zero route_node=%d raw_hex=%s",
+      route.node_id,
+      hex_digest(raw).c_str());
+    clear_inflight(query_inflight);
+    return true;
+  }
+  if (parsed_node_id != static_cast<uint8_t>(route.node_id & 0xFF)) {
+    ++parse_failures;
+    RCLCPP_WARN(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "[Hightorque] classify=node_reject reason=node_mismatch parsed_node=%u route_node=%d raw_hex=%s",
+      static_cast<unsigned int>(parsed_node_id),
+      route.node_id,
+      hex_digest(raw).c_str());
+    clear_inflight(query_inflight);
+    return true;
+  }
+
   out_state.position = parsed_pos;
   out_state.velocity = parsed_vel;
   out_state.available = true;
   RCLCPP_INFO(
     rclcpp::get_logger("RealMixedRobotBackend"),
     "[Hightorque] parsed state classify=parsed_ok node_id=0x%X position=%.6f velocity=%.6f available=true online=true",
-    static_cast<unsigned int>(parsed_can_id & 0xFF),
+    static_cast<unsigned int>(parsed_node_id),
     out_state.position,
     out_state.velocity);
   ++valid_samples;
@@ -2289,6 +2366,7 @@ bool RealMixedRobotBackend::enable()
     hightorque_command_family_.c_str(),
     hightorque_position_hold_active_ ? "active" : "inactive");
 
+  bool missing_hightorque_sample = false;
   for (const auto & route : routes_) {
     if (route.driver == "hightorque_canfd") {
       std::string hold_target_source = "fallback";
@@ -2315,6 +2393,7 @@ bool RealMixedRobotBackend::enable()
       if (!allow_enter_hold) {
         hightorque_hold_ready_[route.joint_name] = false;
         hightorque_hold_targets_.erase(route.joint_name);
+        missing_hightorque_sample = true;
         RCLCPP_WARN(
           rclcpp::get_logger("RealMixedRobotBackend"),
           "HIGHTORQUE_HOLD_INIT joint=%s hold_target_source=%s sampled_position_turns=%.6f frozen_hold_target_turns=nan allow_enter_hold=false skip hold activation because no valid sample yet",
@@ -2373,6 +2452,15 @@ bool RealMixedRobotBackend::enable()
         return false;
       }
     }
+  }
+
+  if (missing_hightorque_sample) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "enable rejected: one or more hightorque joints have no stable valid sample");
+    hightorque_position_hold_active_ = false;
+    enabled_ = false;
+    return false;
   }
 
   hightorque_position_hold_active_ = true;
