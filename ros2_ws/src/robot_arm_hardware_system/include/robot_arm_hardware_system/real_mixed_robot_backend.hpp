@@ -8,10 +8,12 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "robot_arm_hardware_system/backend_interface.hpp"
 
@@ -146,6 +148,10 @@ private:
   void polling_loop_yiyou();
   void hightorque_tx_loop();
   void write_cache_locked(const std::string & joint_name, const JointState & state);
+  bool resolve_bridge_devices();
+  bool probe_hightorque_on_device(const std::string & device, const std::set<int> & node_ids);
+  bool probe_yiyou_on_device(const std::string & device, int node_id);
+  bool get_recent_last_good_state(const std::string & joint_name, JointState & out_state, double max_age_sec);
 
   bool discover_hightorque_joints();
   bool discover_yiyou_joints();
@@ -161,6 +167,9 @@ private:
   HightorqueReadChannel hightorque_channel_;
   YiyouReadChannel yiyou_channel_;
   std::unordered_map<std::string, JointState> latest_cache_;
+  std::unordered_map<std::string, JointState> latest_poll_result_;
+  std::unordered_map<std::string, JointState> last_good_cache_;
+  std::unordered_map<std::string, double> last_good_time_sec_;
   std::mutex cache_mutex_;
   std::thread hightorque_polling_thread_;
   std::thread yiyou_polling_thread_;
@@ -188,6 +197,8 @@ private:
   bool hightorque_position_hold_supported_{false};
   bool hightorque_mode_log_once_{false};
   bool hightorque_position_hold_active_{false};
+  double sample_recency_window_sec_{0.5};
+  int sync_wait_timeout_ms_{2000};
   std::atomic<bool> enabled_{false};
   std::atomic<bool> faulted_{false};
 };
