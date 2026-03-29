@@ -302,21 +302,17 @@ std::string build_slcan_D_frame(uint32_t can_id, const std::vector<uint8_t> & da
 
 std::string build_hightorque_read_query(const JointRoute & route)
 {
-  // HighTorque CAN-FD read command family uses `D...` (verified manually).
-  // Use full CAN-FD bridge frame style (DLC=A => 16-byte payload),
-  // aligned with manually verified successful D... framing characteristics.
-  // Minimal state-read core payload: 0x01 0x00 0x00 0x14 0x04 0x00 0x11 0x0F
-  // then pad/fill to 16 bytes with 0x50 0x50 tail marker.
+  // Official H730 CAN-FD INT32 status query:
+  // read_motor_state_int32 -> {0x18,0x04,0x00,0x11,0x0F}
+  // (docs/vendor/hightorque/.../src/livelybot_fdcan/livelybot_fdcan.c)
   const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-  return build_slcan_D_frame(
-    can_id, {0x01, 0x00, 0x00, 0x14, 0x04, 0x00, 0x11, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x50});
+  return build_slcan_D_frame(can_id, {0x18, 0x04, 0x00, 0x11, 0x0F});
 }
 
 std::string build_hightorque_full_status_query(const JointRoute & route)
 {
-  // Follow-up query after bridge ACK, used to fetch full status response.
-  const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-  return build_slcan_D_frame(can_id, {0x1C, 0x04, 0x00, 0x11, 0x0F});
+  // Keep compatibility alias with explicit official INT32 query.
+  return build_hightorque_read_query(route);
 }
 
 std::string build_yiyou_read_query(const JointRoute & route, uint8_t reg_addr)
@@ -369,10 +365,24 @@ bool parse_hightorque_full_status(
   double & pos_out,
   double & vel_out,
   std::string & reason,
-  uint32_t & can_id_out)
+  uint32_t & can_id_out,
+  int expected_node_id)
 {
   std::vector<uint8_t> payload;
   if (!parse_slcan_D_payload(raw, payload, can_id_out, reason)) {
+    return false;
+  }
+  if (expected_node_id <= 0 || expected_node_id > 0xFF) {
+    reason = "invalid_expected_node";
+    return false;
+  }
+  const int parsed_node_id = static_cast<int>((can_id_out >> 8) & 0xFFu);
+  if (parsed_node_id <= 0) {
+    reason = "invalid_node_id_zero";
+    return false;
+  }
+  if (parsed_node_id != expected_node_id) {
+    reason = "node_id_mismatch";
     return false;
   }
 
@@ -698,27 +708,26 @@ struct LegacyProtocolDeviceActions final
   }
 
   static bool parse_hightorque_query_reply(
+    const JointRoute & route,
     const std::string & raw,
     double & pos_out,
     double & vel_out,
     std::string & reason,
     uint32_t & can_id_out)
   {
-    return parse_hightorque_full_status(raw, pos_out, vel_out, reason, can_id_out);
+    return parse_hightorque_full_status(raw, pos_out, vel_out, reason, can_id_out, route.node_id);
   }
 
   // NOTE: currently not wired into write path; kept to define action boundary.
   static std::string hightorque_stop(const JointRoute & route)
   {
-    const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-    return build_slcan_D_frame(can_id, {0x01, 0x00, 0x00, 0x14, 0x04, 0x00, 0x11, 0x0F});
+    return build_hightorque_stop_int32(route);
   }
 
   // NOTE: currently not wired into write path; kept to define action boundary.
   static std::string hightorque_brake(const JointRoute & route)
   {
-    const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-    return build_slcan_D_frame(can_id, {0x01, 0x00, 0x0F, 0x14, 0x04, 0x00, 0x11, 0x0F});
+    return build_hightorque_brake_int32(route);
   }
 
   // NOTE: currently not wired into write path; kept to define action boundary.
@@ -1435,52 +1444,20 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
   ++frames_seen;
   out_state.online = true;
   if (is_hightorque_bridge_ack(raw)) {
-    static uint64_t ack_count = 0;
-    ++ack_count;
-    RCLCPP_INFO(
+    RCLCPP_WARN(
       rclcpp::get_logger("RealMixedRobotBackend"),
-      "[Hightorque] short_ack/bridge_ack detected (ack_count=%lu, raw_len=%zu, raw_hex=%s, raw_ascii_escaped='%s', next_step=need_full_status_query)",
-      static_cast<unsigned long>(ack_count),
-      raw.size(),
+      "[Hightorque] bridge ack only (no state payload), skip sample: raw_hex=%s raw_ascii_escaped='%s'",
       hex_digest(raw).c_str(),
       ascii_escaped(raw).c_str());
-    const std::string full_status_query = LegacyProtocolDeviceActions::hightorque_query_full_status(route);
-    RCLCPP_INFO(
-      rclcpp::get_logger("RealMixedRobotBackend"),
-      "[Hightorque] full_status_query tx ascii_escaped='%s' tx_hex=%s tx_len=%zu",
-      ascii_escaped(full_status_query).c_str(),
-      hex_digest(full_status_query).c_str(),
-      full_status_query.size());
-    if (!send_query("Hightorque", fd, full_status_query, send_failures, read_attempts)) {
-      clear_inflight(query_inflight);
-      return true;
-    }
-    std::string full_raw;
-    if (!read_raw_frame(fd, full_raw, recv_timeouts, "Hightorque", read_attempts)) {
-      clear_inflight(query_inflight);
-      return false;
-    }
-    if (full_raw.empty()) {
-      RCLCPP_WARN(
-        rclcpp::get_logger("RealMixedRobotBackend"),
-        "[Hightorque] full_status_response missing after bridge_ack");
-      clear_inflight(query_inflight);
-      return true;
-    }
-    RCLCPP_INFO(
-      rclcpp::get_logger("RealMixedRobotBackend"),
-      "[Hightorque] full_status_response raw_len=%zu raw_hex=%s raw_ascii_escaped='%s'",
-      full_raw.size(),
-      hex_digest(full_raw).c_str(),
-      ascii_escaped(full_raw).c_str());
-    raw = full_raw;
+    clear_inflight(query_inflight);
+    return true;
   }
   double parsed_pos = 0.0;
   double parsed_vel = 0.0;
   uint32_t parsed_can_id = 0;
   std::string parse_reason;
   const bool parsed_ok = LegacyProtocolDeviceActions::parse_hightorque_query_reply(
-    raw, parsed_pos, parsed_vel, parse_reason, parsed_can_id);
+    route, raw, parsed_pos, parsed_vel, parse_reason, parsed_can_id);
   if (!parsed_ok) {
     ++parse_failures;
     RCLCPP_WARN(
@@ -1501,8 +1478,9 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
   out_state.available = true;
   RCLCPP_INFO(
     rclcpp::get_logger("RealMixedRobotBackend"),
-    "[Hightorque] parsed state classify=parsed_ok node_id=0x%X position=%.6f velocity=%.6f available=true online=true",
-    static_cast<unsigned int>(parsed_can_id & 0xFF),
+    "[Hightorque] parsed state classify=parsed_ok node_id=0x%X expected_node=%d position=%.6f velocity=%.6f available=true online=true",
+    static_cast<unsigned int>((parsed_can_id >> 8) & 0xFF),
+    route.node_id,
     out_state.position,
     out_state.velocity);
   ++valid_samples;
@@ -2289,6 +2267,9 @@ bool RealMixedRobotBackend::enable()
     hightorque_command_family_.c_str(),
     hightorque_position_hold_active_ ? "active" : "inactive");
 
+  const double now_sec = now_monotonic_sec();
+  constexpr double kEnableSampleMaxAgeSec = 0.5;
+
   for (const auto & route : routes_) {
     if (route.driver == "hightorque_canfd") {
       std::string hold_target_source = "fallback";
@@ -2302,13 +2283,16 @@ bool RealMixedRobotBackend::enable()
           sampled_position_turns = cache_it->second.position;
           if (
             cache_it->second.available && cache_it->second.online &&
-            std::isfinite(cache_it->second.position))
+            std::isfinite(cache_it->second.position) &&
+            cache_it->second.last_update_time_sec > 0.0 &&
+            (now_sec - cache_it->second.last_update_time_sec) <= kEnableSampleMaxAgeSec &&
+            !cache_it->second.stale)
           {
             hold_target_source = "valid_sample";
             frozen_hold_target_turns = cache_it->second.position;
             allow_enter_hold = true;
           } else {
-            hold_target_source = "default_cache";
+            hold_target_source = "stale_or_invalid_sample";
           }
         }
       }
@@ -2321,7 +2305,9 @@ bool RealMixedRobotBackend::enable()
           route.joint_name.c_str(),
           hold_target_source.c_str(),
           sampled_position_turns);
-        continue;
+        enabled_ = false;
+        hightorque_position_hold_active_ = false;
+        return false;
       }
 
       const auto cfg_it = hightorque_joint_mit2_config_.find(route.joint_name);
