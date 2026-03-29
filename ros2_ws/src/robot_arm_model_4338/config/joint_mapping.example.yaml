@@ -1,0 +1,46 @@
+# 4338 model mapping example
+# This file is an example template for model-layer configuration only.
+# Do not hardcode this mapping into robot_arm_core / web / moveit packages.
+
+joints:
+  joint_1:
+    driver: hightorque_canfd
+    bus: canfd_main
+    node_id: 1
+    direction_sign: -1
+    position_offset: 0.0
+
+  joint_2:
+    driver: yiyou_can20a
+    bus: can_j2
+    node_id: 2
+    direction_sign: -1
+    position_offset: 0.0
+
+  joint_3:
+    driver: hightorque_canfd
+    bus: canfd_main
+    node_id: 3
+    direction_sign: 1
+    position_offset: 0.0
+
+  joint_4:
+    driver: hightorque_canfd
+    bus: canfd_main
+    node_id: 4
+    direction_sign: 1
+    position_offset: 0.0
+
+  joint_5:
+    driver: hightorque_canfd
+    bus: canfd_main
+    node_id: 5
+    direction_sign: 1
+    position_offset: 0.0
+
+  joint_6:
+    driver: hightorque_canfd
+    bus: canfd_main
+    node_id: 6
+    direction_sign: 1
+    position_offset: 0.0

@@ -1,0 +1,10 @@
+<library path="robot_arm_hardware_system">
+  <class
+    name="robot_arm_hardware_system/RobotArmHardwareSystem"
+    type="robot_arm_hardware_system::RobotArmHardwareSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Unified 6-joint ros2_control system skeleton for mixed-protocol dual-bus hardware.
+    </description>
+  </class>
+</library>

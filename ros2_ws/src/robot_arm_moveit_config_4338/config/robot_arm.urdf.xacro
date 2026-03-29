@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="robot_arm">
+    <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+    <xacro:arg name="use_fake_hardware" default="true" />
+    <xacro:arg name="backend_mode" default="fake" />
+    <xacro:arg name="joint_mapping_path" default="" />
+    <xacro:arg name="auto_enable_on_activate" default="false" />
+    <xacro:arg name="auto_enable_delay_sec" default="1.0" />
+
+    <!--
+      Runtime robot_description source is unified here.
+      Deprecated for runtime: robot_arm_description_4338/urdf/robot_arm.urdf
+      (contains legacy gazebo ros_control snippets that must not leak into bringup/controller_manager).
+    -->
+    <xacro:include filename="robot_arm.runtime.urdf" />
+
+    <!-- Import control_xacro -->
+    <xacro:include filename="robot_arm.ros2_control.xacro" />
+
+    <xacro:robot_arm_ros2_control
+      name="RobotArmSystem"
+      initial_positions_file="$(arg initial_positions_file)"
+      use_fake_hardware="$(arg use_fake_hardware)"
+      backend_mode="$(arg backend_mode)"
+      joint_mapping_path="$(arg joint_mapping_path)"
+      auto_enable_on_activate="$(arg auto_enable_on_activate)"
+      auto_enable_delay_sec="$(arg auto_enable_delay_sec)"/>
+
+</robot>
