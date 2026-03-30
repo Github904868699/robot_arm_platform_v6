@@ -2542,6 +2542,20 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
       if (route.driver == "hightorque_canfd") {
         auto & desired = hightorque_desired_commands_[route.joint_name];
         desired.position_turns = target;
+        if (std::isfinite(commands[i].velocity)) {
+          desired.velocity_rps = commands[i].velocity;
+          desired.has_velocity = true;
+        } else {
+          desired.velocity_rps = 0.0;
+          desired.has_velocity = false;
+          static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+          RCLCPP_DEBUG_THROTTLE(
+            rclcpp::get_logger("RealMixedRobotBackend"),
+            steady_clock,
+            2000,
+            "write_all_joint_commands: velocity fallback to 0 joint=%s",
+            route.joint_name.c_str());
+        }
         desired.stamp_sec = now_sec;
         desired.valid = true;
         if (target_updated) {
@@ -2668,6 +2682,8 @@ bool RealMixedRobotBackend::enable()
       std::scoped_lock<std::mutex> tx_lock(hightorque_tx_mutex_);
       auto & desired = hightorque_desired_commands_[seed.route.joint_name];
       desired.position_turns = seed.target_turns;
+      desired.velocity_rps = 0.0;
+      desired.has_velocity = false;
       desired.stamp_sec = now_monotonic_sec();
       desired.valid = true;
     }
@@ -2938,6 +2954,8 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         desired = desired_it->second;
       } else {
         desired.position_turns = hightorque_hold_targets_[route.joint_name];
+        desired.velocity_rps = 0.0;
+        desired.has_velocity = false;
         desired.stamp_sec = now_monotonic_sec();
         desired.valid = true;
       }
@@ -2958,8 +2976,8 @@ void RealMixedRobotBackend::hightorque_tx_loop()
       const double prev_target_t = hightorque_last_velocity_target_time_sec_.count(route.joint_name) ?
         hightorque_last_velocity_target_time_sec_[route.joint_name] : desired.stamp_sec;
 
-      double raw_vel = 0.0;
-      if (desired.stamp_sec > prev_target_t + 1e-6) {
+      double raw_vel = desired.has_velocity ? desired.velocity_rps : 0.0;
+      if (!desired.has_velocity && desired.stamp_sec > prev_target_t + 1e-6) {
         raw_vel = (desired.position_turns - prev_target) / std::max(0.001, desired.stamp_sec - prev_target_t);
       }
       const double vel_limit = std::max(0.1, cfg.max_velocity_rps);
@@ -3003,10 +3021,11 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         rclcpp::get_logger("RealMixedRobotBackend"),
         steady_clock,
         500,
-        "HIGHTORQUE_MIT2_SERVO joint=%s target_turns=%.6f vel_feed_rps=%.6f kp=%.3f kd=%.3f tqe_nm=%.3f period_ms=%d",
+        "HIGHTORQUE_MIT2_SERVO joint=%s target_turns=%.6f vel_feed_rps=%.6f vel_src=%s kp=%.3f kd=%.3f tqe_nm=%.3f period_ms=%d",
         route.joint_name.c_str(),
         desired.position_turns,
         hightorque_filtered_velocity_[route.joint_name],
+        desired.has_velocity ? "controller" : "position_diff_fallback",
         cfg.kp,
         cfg.kd,
         cfg.tqe_nm,

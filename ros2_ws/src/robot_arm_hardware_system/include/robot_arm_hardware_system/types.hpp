@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <limits>
 #include <vector>
 
 namespace robot_arm_hardware_system
@@ -21,6 +22,7 @@ struct JointState
 struct JointCommand
 {
   double position{0.0};
+  double velocity{std::numeric_limits<double>::quiet_NaN()};
 };
 
 struct JointRoute

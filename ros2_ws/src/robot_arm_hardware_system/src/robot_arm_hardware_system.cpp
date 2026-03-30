@@ -144,7 +144,8 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_init(
 
   hw_positions_.assign(joint_names_.size(), 0.0);
   hw_velocities_.assign(joint_names_.size(), 0.0);
-  hw_commands_.assign(joint_names_.size(), 0.0);
+  hw_position_commands_.assign(joint_names_.size(), 0.0);
+  hw_velocity_commands_.assign(joint_names_.size(), 0.0);
   hold_targets_.assign(joint_names_.size(), 0.0);
 
   runtime_state_ = RuntimeState::DISCOVERING;
@@ -179,7 +180,10 @@ std::vector<hardware_interface::CommandInterface> RobotArmHardwareSystem::export
 {
   std::vector<hardware_interface::CommandInterface> command_interfaces;
   for (size_t i = 0; i < joint_names_.size(); ++i) {
-    command_interfaces.emplace_back(joint_names_[i], hardware_interface::HW_IF_POSITION, &hw_commands_[i]);
+    command_interfaces.emplace_back(
+      joint_names_[i], hardware_interface::HW_IF_POSITION, &hw_position_commands_[i]);
+    command_interfaces.emplace_back(
+      joint_names_[i], hardware_interface::HW_IF_VELOCITY, &hw_velocity_commands_[i]);
   }
   return command_interfaces;
 }
@@ -237,7 +241,8 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_activate(
     const auto * route = router_.route_for(joint_names_[i]);
     hw_positions_[i] = backend_position_to_ros(route, synced[i].position);
     hw_velocities_[i] = backend_velocity_to_ros(route, synced[i].velocity);
-    hw_commands_[i] = hw_positions_[i];
+    hw_position_commands_[i] = hw_positions_[i];
+    hw_velocity_commands_[i] = 0.0;
     RCLCPP_INFO(
       rclcpp::get_logger("RobotArmHardwareSystem"),
       "on_activate: joint=%s online=%s available=%s pos_ros_rad=%.6f vel_ros_rad_s=%.6f",
@@ -353,8 +358,11 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
   if (!enabled_) {
     // READY_UNARMED and earlier states must reject motion writes.
     bool motion_requested = false;
-    for (size_t i = 0; i < hw_commands_.size(); ++i) {
-      if (std::abs(hw_commands_[i] - hw_positions_[i]) > kMotionRejectEpsilonRad) {
+    for (size_t i = 0; i < hw_position_commands_.size(); ++i) {
+      if (
+        std::abs(hw_position_commands_[i] - hw_positions_[i]) > kMotionRejectEpsilonRad ||
+        std::abs(hw_velocity_commands_[i]) > kMotionRejectEpsilonRad)
+      {
         motion_requested = true;
         break;
       }
@@ -367,8 +375,9 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
         1000,
         "write ignored: system is not enabled (state=READY_UNARMED/earlier), keep current position.");
       // Keep command buffer aligned to current state so controllers won't accumulate stale deltas.
-      for (size_t i = 0; i < hw_commands_.size(); ++i) {
-        hw_commands_[i] = hw_positions_[i];
+      for (size_t i = 0; i < hw_position_commands_.size(); ++i) {
+        hw_position_commands_[i] = hw_positions_[i];
+        hw_velocity_commands_[i] = 0.0;
       }
     }
     return hardware_interface::return_type::OK;
@@ -377,7 +386,25 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
   std::vector<JointCommand> commands(joint_names_.size());
   for (size_t i = 0; i < commands.size(); ++i) {
     const auto * route = router_.route_for(joint_names_[i]);
-    commands[i].position = ros_position_to_backend(route, hw_commands_[i]);
+    commands[i].position = ros_position_to_backend(route, hw_position_commands_[i]);
+
+    if (std::isfinite(hw_velocity_commands_[i])) {
+      if (route == nullptr) {
+        commands[i].velocity = hw_velocity_commands_[i];
+      } else if (route->driver == "hightorque_canfd") {
+        commands[i].velocity = (hw_velocity_commands_[i] / kTwoPi) / route->direction_sign;
+      } else if (route->driver == "yiyou_can20a") {
+        commands[i].velocity = (hw_velocity_commands_[i] * 60.0 / kTwoPi) / route->direction_sign;
+      } else {
+        commands[i].velocity = hw_velocity_commands_[i] / route->direction_sign;
+      }
+    } else {
+      commands[i].velocity = 0.0;
+      RCLCPP_DEBUG(
+        rclcpp::get_logger("RobotArmHardwareSystem"),
+        "write: velocity command nan fallback to 0 joint=%s",
+        joint_names_[i].c_str());
+    }
   }
 
   if (!backend_->write_all_joint_commands(commands)) {
@@ -605,7 +632,8 @@ bool RobotArmHardwareSystem::load_routing()
 void RobotArmHardwareSystem::set_hold_targets_from_current()
 {
   std::copy(hw_positions_.begin(), hw_positions_.end(), hold_targets_.begin());
-  hw_commands_ = hold_targets_;
+  hw_position_commands_ = hold_targets_;
+  std::fill(hw_velocity_commands_.begin(), hw_velocity_commands_.end(), 0.0);
 }
 
 void RobotArmHardwareSystem::setup_backend_services()

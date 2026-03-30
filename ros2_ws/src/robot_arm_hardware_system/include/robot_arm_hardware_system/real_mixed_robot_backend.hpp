@@ -34,6 +34,8 @@ struct HightorqueMit2Config
 struct HightorqueDesiredCommand
 {
   double position_turns{0.0};
+  double velocity_rps{0.0};
+  bool has_velocity{false};
   double stamp_sec{0.0};
   bool valid{false};
 };
