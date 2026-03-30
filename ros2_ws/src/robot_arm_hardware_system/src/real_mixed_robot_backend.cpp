@@ -1467,7 +1467,7 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
   reset_input_buffer_only("Hightorque", fd);
   // Legacy protocol path: temporary C++ action boundary call.
   const std::string query = LegacyProtocolDeviceActions::hightorque_query(route);
-  if (!send_query("Hightorque", fd, query, send_failures, read_attempts)) {
+  if (!send_query("Hightorque", fd, query, send_failures, read_attempts, false)) {
     clear_inflight(query_inflight);
     return true;
   }
@@ -1512,7 +1512,7 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
       ascii_escaped(full_status_query).c_str(),
       hex_digest(full_status_query).c_str(),
       full_status_query.size());
-    if (!send_query("Hightorque", fd, full_status_query, send_failures, read_attempts)) {
+    if (!send_query("Hightorque", fd, full_status_query, send_failures, read_attempts, false)) {
       clear_inflight(query_inflight);
       return true;
     }
@@ -1778,7 +1778,7 @@ bool YiyouReadChannel::read_joint(const JointRoute & route, JointState & out_sta
         reg_name,
         ascii_escaped(query).c_str(),
         hex_digest(query).c_str());
-      if (!send_query("Yiyou", fd, query, send_failures, read_attempts)) {
+      if (!send_query("Yiyou", fd, query, send_failures, read_attempts, false)) {
         return false;
       }
       std::string raw;
@@ -2427,7 +2427,12 @@ bool RealMixedRobotBackend::send_yiyou_write_u32(
     ascii_escaped(query).c_str(),
     hex_digest(query).c_str());
 
-  if (!send_query("Yiyou", yiyou_channel_.fd, query, yiyou_channel_.send_failures, yiyou_channel_.read_attempts)) {
+  const bool drain_after_write =
+    !(semantic == "write_target_speed" || semantic == "write_target_position");
+  if (!send_query(
+      "Yiyou", yiyou_channel_.fd, query, yiyou_channel_.send_failures,
+      yiyou_channel_.read_attempts, drain_after_write))
+  {
     RCLCPP_ERROR(
       rclcpp::get_logger("RealMixedRobotBackend"),
       "[Yiyou][WRITE] semantic=%s joint=%s send failed",
