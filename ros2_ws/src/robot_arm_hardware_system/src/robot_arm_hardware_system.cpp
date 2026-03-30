@@ -185,6 +185,9 @@ std::vector<hardware_interface::CommandInterface> RobotArmHardwareSystem::export
     command_interfaces.emplace_back(
       joint_names_[i], hardware_interface::HW_IF_VELOCITY, &hw_velocity_commands_[i]);
   }
+  RCLCPP_INFO(
+    rclcpp::get_logger("RobotArmHardwareSystem"),
+    "Command interfaces are [position velocity]");
   return command_interfaces;
 }
 
@@ -384,9 +387,12 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
   }
 
   std::vector<JointCommand> commands(joint_names_.size());
+  bool trajectory_active = false;
+  constexpr double kVelocityZeroEpsRad = 1e-5;
   for (size_t i = 0; i < commands.size(); ++i) {
     const auto * route = router_.route_for(joint_names_[i]);
     commands[i].position = ros_position_to_backend(route, hw_position_commands_[i]);
+    const double pos_delta = std::abs(hw_position_commands_[i] - hw_positions_[i]);
 
     if (std::isfinite(hw_velocity_commands_[i])) {
       if (route == nullptr) {
@@ -398,13 +404,34 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
       } else {
         commands[i].velocity = hw_velocity_commands_[i] / route->direction_sign;
       }
+      if (std::abs(hw_velocity_commands_[i]) > kVelocityZeroEpsRad || pos_delta > kMotionRejectEpsilonRad) {
+        trajectory_active = true;
+      }
     } else {
       commands[i].velocity = 0.0;
       RCLCPP_DEBUG(
         rclcpp::get_logger("RobotArmHardwareSystem"),
         "write: velocity command nan fallback to 0 joint=%s",
         joint_names_[i].c_str());
+      if (pos_delta > kMotionRejectEpsilonRad) {
+        trajectory_active = true;
+      }
     }
+  }
+
+  const bool was_executing = (runtime_state_ == RuntimeState::EXECUTING);
+  if (!was_executing && trajectory_active) {
+    RCLCPP_INFO(
+      rclcpp::get_logger("RobotArmHardwareSystem"),
+      "HOLD_HANDOFF begin: ARMED_SERVO_HOLD -> EXECUTING");
+  } else if (was_executing && !trajectory_active) {
+    for (size_t i = 0; i < hold_targets_.size(); ++i) {
+      hold_targets_[i] = hw_position_commands_[i];
+      hw_velocity_commands_[i] = 0.0;
+    }
+    RCLCPP_INFO(
+      rclcpp::get_logger("RobotArmHardwareSystem"),
+      "HOLD_HANDOFF end: EXECUTING -> ARMED_SERVO_HOLD (freeze final commanded target)");
   }
 
   if (!backend_->write_all_joint_commands(commands)) {
@@ -412,7 +439,7 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
     return hardware_interface::return_type::ERROR;
   }
 
-  runtime_state_ = RuntimeState::EXECUTING;
+  runtime_state_ = trajectory_active ? RuntimeState::EXECUTING : RuntimeState::ARMED_SERVO_HOLD;
   return hardware_interface::return_type::OK;
 }
 

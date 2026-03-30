@@ -79,6 +79,7 @@ private:
   std::vector<std::string> joint_names_;
   std::vector<double> hw_positions_;
   std::vector<double> hw_velocities_;
+  // C-lite command cache: keep position/velocity command buffers separately.
   std::vector<double> hw_position_commands_;
   std::vector<double> hw_velocity_commands_;
   std::vector<double> hold_targets_;

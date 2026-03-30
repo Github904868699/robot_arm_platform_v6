@@ -1864,6 +1864,8 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   hightorque_last_velocity_target_.clear();
   hightorque_last_velocity_target_time_sec_.clear();
   hightorque_hold_mode_.clear();
+  hightorque_trajectory_active_.clear();
+  hightorque_hold_handoff_time_sec_.clear();
   yiyou_desired_position_.clear();
   yiyou_last_sent_position_.clear();
   yiyou_last_send_time_sec_.clear();
@@ -2525,7 +2527,7 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
 
   bool has_motion_delta = false;
   constexpr double kCommandDeltaEpsTurns = 1e-4;
-  constexpr double kYiyouMoveDeadbandTurns = 2e-4;
+  constexpr double kVelocityHoldEps = 1e-4;
   bool fatal_error = false;
   uint64_t hightorque_enqueued = 0;
   uint64_t yiyou_write_count = 0;
@@ -2557,9 +2559,11 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
       if (route.driver == "hightorque_canfd") {
         auto & desired = hightorque_desired_commands_[route.joint_name];
         desired.position_turns = target;
+        bool has_nonzero_velocity = false;
         if (std::isfinite(commands[i].velocity)) {
           desired.velocity_rps = commands[i].velocity;
-          desired.has_velocity = true;
+          has_nonzero_velocity = std::abs(commands[i].velocity) > kVelocityHoldEps;
+          desired.has_velocity = has_nonzero_velocity;
         } else {
           desired.velocity_rps = 0.0;
           desired.has_velocity = false;
@@ -2573,8 +2577,20 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
         }
         desired.stamp_sec = now_sec;
         desired.valid = true;
-        if (target_updated) {
-          hightorque_hold_targets_[route.joint_name] = target;
+        const bool was_traj_active = hightorque_trajectory_active_[route.joint_name];
+        const bool now_traj_active = target_updated || has_nonzero_velocity;
+        hightorque_trajectory_active_[route.joint_name] = now_traj_active;
+        hightorque_hold_mode_[route.joint_name] = !now_traj_active;
+        hightorque_hold_targets_[route.joint_name] = target;
+        if (was_traj_active != now_traj_active) {
+          hightorque_hold_handoff_time_sec_[route.joint_name] = now_sec;
+          RCLCPP_INFO(
+            rclcpp::get_logger("RealMixedRobotBackend"),
+            "HIGHTORQUE_HANDOFF joint=%s phase=%s target_turns=%.6f vel_rps=%.6f",
+            route.joint_name.c_str(),
+            now_traj_active ? "trajectory_active" : "hold_active",
+            target,
+            desired.velocity_rps);
         }
         ++hightorque_enqueued;
       } else if (route.driver == "yiyou_can20a") {
@@ -2959,6 +2975,11 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         desired.has_velocity = false;
         desired.stamp_sec = now_monotonic_sec();
         desired.valid = true;
+      }
+      if (hightorque_hold_mode_[route.joint_name]) {
+        desired.position_turns = hightorque_hold_targets_[route.joint_name];
+        desired.velocity_rps = 0.0;
+        desired.has_velocity = false;
       }
       const auto cfg_it = hightorque_joint_mit2_config_.find(route.joint_name);
       const auto cfg = cfg_it != hightorque_joint_mit2_config_.end() ? cfg_it->second : hightorque_mit2_config_;

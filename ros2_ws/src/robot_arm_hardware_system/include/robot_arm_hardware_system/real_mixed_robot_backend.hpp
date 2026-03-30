@@ -191,6 +191,8 @@ private:
   std::condition_variable hightorque_tx_cv_;
   std::unordered_map<std::string, HightorqueDesiredCommand> hightorque_desired_commands_;
   std::unordered_map<std::string, bool> hightorque_hold_mode_;
+  std::unordered_map<std::string, bool> hightorque_trajectory_active_;
+  std::unordered_map<std::string, double> hightorque_hold_handoff_time_sec_;
   std::unordered_map<std::string, double> hightorque_last_sent_position_;
   std::unordered_map<std::string, double> hightorque_last_send_time_sec_;
   std::unordered_map<std::string, double> hightorque_filtered_velocity_;
