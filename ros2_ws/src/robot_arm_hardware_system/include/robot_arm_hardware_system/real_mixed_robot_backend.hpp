@@ -144,6 +144,14 @@ public:
   std::string backend_name() const override { return "real_mixed_readonly_placeholder"; }
 
 private:
+  enum class HightorqueControlMode
+  {
+    DISABLED,
+    HOLD_ACTIVE,
+    TRAJECTORY_ACTIVE,
+    HOLD_PENDING_AFTER_TRAJECTORY,
+  };
+
   void start_polling_worker();
   void stop_polling_worker();
   void polling_loop_hightorque();
@@ -193,6 +201,9 @@ private:
   std::unordered_map<std::string, bool> hightorque_hold_mode_;
   std::unordered_map<std::string, bool> hightorque_trajectory_active_;
   std::unordered_map<std::string, double> hightorque_hold_handoff_time_sec_;
+  std::unordered_map<std::string, double> hightorque_last_trajectory_target_;
+  HightorqueControlMode hightorque_control_mode_{HightorqueControlMode::DISABLED};
+  double hightorque_hold_pending_since_sec_{0.0};
   std::unordered_map<std::string, double> hightorque_last_sent_position_;
   std::unordered_map<std::string, double> hightorque_last_send_time_sec_;
   std::unordered_map<std::string, double> hightorque_filtered_velocity_;

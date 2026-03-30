@@ -1866,11 +1866,14 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   hightorque_hold_mode_.clear();
   hightorque_trajectory_active_.clear();
   hightorque_hold_handoff_time_sec_.clear();
+  hightorque_last_trajectory_target_.clear();
   yiyou_desired_position_.clear();
   yiyou_last_sent_position_.clear();
   yiyou_last_send_time_sec_.clear();
   hightorque_joint_mit2_config_.clear();
   hightorque_position_hold_active_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_hold_pending_since_sec_ = 0.0;
   write_path_warned_ = false;
   {
     std::scoped_lock<std::mutex> lock(cache_mutex_);
@@ -2529,6 +2532,7 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
   constexpr double kCommandDeltaEpsTurns = 1e-4;
   constexpr double kVelocityHoldEps = 1e-4;
   bool fatal_error = false;
+  bool any_hightorque_trajectory_active = false;
   uint64_t hightorque_enqueued = 0;
   uint64_t yiyou_write_count = 0;
   uint64_t yiyou_write_us = 0;
@@ -2579,9 +2583,12 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
         desired.valid = true;
         const bool was_traj_active = hightorque_trajectory_active_[route.joint_name];
         const bool now_traj_active = target_updated || has_nonzero_velocity;
+        any_hightorque_trajectory_active = any_hightorque_trajectory_active || now_traj_active;
         hightorque_trajectory_active_[route.joint_name] = now_traj_active;
-        hightorque_hold_mode_[route.joint_name] = !now_traj_active;
-        hightorque_hold_targets_[route.joint_name] = target;
+        hightorque_hold_mode_[route.joint_name] = false;
+        if (now_traj_active) {
+          hightorque_last_trajectory_target_[route.joint_name] = target;
+        }
         if (was_traj_active != now_traj_active) {
           hightorque_hold_handoff_time_sec_[route.joint_name] = now_sec;
           RCLCPP_INFO(
@@ -2599,6 +2606,50 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
       }
 
       last_command_position_[route.joint_name] = target;
+    }
+
+    constexpr double kHoldPendingDurationSec = 0.12;
+    const auto mode_name = [](HightorqueControlMode mode) {
+        switch (mode) {
+          case HightorqueControlMode::DISABLED: return "DISABLED";
+          case HightorqueControlMode::HOLD_ACTIVE: return "HOLD_ACTIVE";
+          case HightorqueControlMode::TRAJECTORY_ACTIVE: return "TRAJECTORY_ACTIVE";
+          case HightorqueControlMode::HOLD_PENDING_AFTER_TRAJECTORY:
+            return "HOLD_PENDING_AFTER_TRAJECTORY";
+          default: return "UNKNOWN";
+        }
+      };
+    if (any_hightorque_trajectory_active) {
+      if (hightorque_control_mode_ != HightorqueControlMode::TRAJECTORY_ACTIVE) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("RealMixedRobotBackend"),
+          "HIGHTORQUE_CONTROL_MODE transition %s -> %s",
+          mode_name(hightorque_control_mode_),
+          mode_name(HightorqueControlMode::TRAJECTORY_ACTIVE));
+      }
+      hightorque_control_mode_ = HightorqueControlMode::TRAJECTORY_ACTIVE;
+      hightorque_hold_pending_since_sec_ = 0.0;
+    } else if (hightorque_control_mode_ == HightorqueControlMode::TRAJECTORY_ACTIVE) {
+      for (const auto & route : hightorque_routes_) {
+        const auto it = hightorque_last_trajectory_target_.find(route.joint_name);
+        if (it != hightorque_last_trajectory_target_.end()) {
+          hightorque_hold_targets_[route.joint_name] = it->second;
+        }
+      }
+      hightorque_hold_pending_since_sec_ = now_sec;
+      hightorque_control_mode_ = HightorqueControlMode::HOLD_PENDING_AFTER_TRAJECTORY;
+      RCLCPP_INFO(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "HIGHTORQUE_CONTROL_MODE transition TRAJECTORY_ACTIVE -> HOLD_PENDING_AFTER_TRAJECTORY");
+    } else if (hightorque_control_mode_ == HightorqueControlMode::HOLD_PENDING_AFTER_TRAJECTORY) {
+      if ((now_sec - hightorque_hold_pending_since_sec_) >= kHoldPendingDurationSec) {
+        hightorque_control_mode_ = HightorqueControlMode::HOLD_ACTIVE;
+        RCLCPP_INFO(
+          rclcpp::get_logger("RealMixedRobotBackend"),
+          "HIGHTORQUE_CONTROL_MODE transition HOLD_PENDING_AFTER_TRAJECTORY -> HOLD_ACTIVE");
+      }
+    } else if (hightorque_control_mode_ == HightorqueControlMode::DISABLED) {
+      hightorque_control_mode_ = HightorqueControlMode::HOLD_ACTIVE;
     }
   }
 
@@ -2640,6 +2691,8 @@ bool RealMixedRobotBackend::enable()
   faulted_ = false;
   hightorque_mode_log_once_ = false;
   hightorque_position_hold_active_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_hold_pending_since_sec_ = 0.0;
   hightorque_hold_targets_.clear();
   hightorque_hold_ready_.clear();
 
@@ -2724,6 +2777,7 @@ bool RealMixedRobotBackend::enable()
   }
 
   hightorque_position_hold_active_ = true;
+  hightorque_control_mode_ = HightorqueControlMode::HOLD_ACTIVE;
   enabled_ = true;
   hightorque_tx_cv_.notify_all();
   return true;
@@ -2732,6 +2786,8 @@ bool RealMixedRobotBackend::enable()
 bool RealMixedRobotBackend::disable()
 {
   hightorque_position_hold_active_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_hold_pending_since_sec_ = 0.0;
   hightorque_tx_cv_.notify_all();
   for (const auto & route : routes_) {
     if (route.driver == "hightorque_canfd") {
@@ -2755,6 +2811,7 @@ bool RealMixedRobotBackend::disable()
   hightorque_hold_targets_.clear();
   hightorque_hold_ready_.clear();
   hightorque_filtered_velocity_.clear();
+  hightorque_last_trajectory_target_.clear();
   enabled_ = false;
   return true;
 }
@@ -2772,6 +2829,7 @@ bool RealMixedRobotBackend::stop()
     }
   }
   enabled_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
   faulted_ = true;
   return ok;
 }
@@ -2961,7 +3019,7 @@ void RealMixedRobotBackend::hightorque_tx_loop()
     jobs.reserve(hightorque_routes_.size());
     for (const auto & route : hightorque_routes_) {
       const bool hold_ready = hightorque_hold_ready_[route.joint_name];
-      if (!enabled_.load() || !hightorque_position_hold_active_ || !hold_ready) {
+      if (!enabled_.load() || !hold_ready || hightorque_control_mode_ == HightorqueControlMode::DISABLED) {
         continue;
       }
 
@@ -2976,10 +3034,16 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         desired.stamp_sec = now_monotonic_sec();
         desired.valid = true;
       }
-      if (hightorque_hold_mode_[route.joint_name]) {
+      const bool use_hold_target =
+        (hightorque_control_mode_ == HightorqueControlMode::HOLD_ACTIVE) ||
+        (hightorque_control_mode_ == HightorqueControlMode::HOLD_PENDING_AFTER_TRAJECTORY);
+      if (use_hold_target) {
         desired.position_turns = hightorque_hold_targets_[route.joint_name];
         desired.velocity_rps = 0.0;
         desired.has_velocity = false;
+        hightorque_hold_mode_[route.joint_name] = true;
+      } else {
+        hightorque_hold_mode_[route.joint_name] = false;
       }
       const auto cfg_it = hightorque_joint_mit2_config_.find(route.joint_name);
       const auto cfg = cfg_it != hightorque_joint_mit2_config_.end() ? cfg_it->second : hightorque_mit2_config_;
@@ -2992,6 +3056,9 @@ void RealMixedRobotBackend::hightorque_tx_loop()
       const auto & route = std::get<0>(job);
       const auto & desired = std::get<1>(job);
       const auto & cfg = std::get<2>(job);
+      const bool hold_mode =
+        (hightorque_control_mode_ == HightorqueControlMode::HOLD_ACTIVE) ||
+        (hightorque_control_mode_ == HightorqueControlMode::HOLD_PENDING_AFTER_TRAJECTORY);
 
       const double prev_target = hightorque_last_velocity_target_.count(route.joint_name) ?
         hightorque_last_velocity_target_[route.joint_name] : desired.position_turns;
@@ -3027,7 +3094,7 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         cfg.model);
 
       const auto t0 = std::chrono::steady_clock::now();
-      if (!send_hightorque_action(route, "mit2_servo_cycle", frame, false)) {
+      if (!send_hightorque_action(route, hold_mode ? "hold_current_position" : "mit2_servo_cycle", frame, false)) {
         faulted_ = true;
         continue;
       }
