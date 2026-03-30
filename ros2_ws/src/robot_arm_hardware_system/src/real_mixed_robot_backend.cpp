@@ -1863,6 +1863,10 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   hightorque_filtered_velocity_.clear();
   hightorque_last_velocity_target_.clear();
   hightorque_last_velocity_target_time_sec_.clear();
+  hightorque_hold_mode_.clear();
+  yiyou_desired_position_.clear();
+  yiyou_last_sent_position_.clear();
+  yiyou_last_send_time_sec_.clear();
   hightorque_joint_mit2_config_.clear();
   hightorque_position_hold_active_ = false;
   write_path_warned_ = false;
@@ -1937,6 +1941,9 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   for (const auto & route : hightorque_routes_) {
     auto cfg = hightorque_mit2_config_;
     maybe_override_joint_mit2_model(route.joint_name, cfg.model);
+    const double kp_default = cfg.kp;
+    const double kd_default = cfg.kd;
+    const double tqe_default = cfg.tqe_nm;
     maybe_override_joint_mit2_param(route.joint_name, "KP", cfg.kp);
     maybe_override_joint_mit2_param(route.joint_name, "KD", cfg.kd);
     maybe_override_joint_mit2_param(route.joint_name, "TQE_NM", cfg.tqe_nm);
@@ -1946,12 +1953,15 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
     hightorque_joint_mit2_config_[route.joint_name] = cfg;
     RCLCPP_INFO(
       rclcpp::get_logger("RealMixedRobotBackend"),
-      "HIGHTORQUE_MIT2_CONFIG joint=%s model=%s kp=%.3f kd=%.3f tqe_nm=%.3f max_vel_rps=%.3f vel_lpf_alpha=%.3f period_ms=%d",
+      "HIGHTORQUE_MIT2_CONFIG joint=%s model=%s kp=%.3f(%s) kd=%.3f(%s) tqe_nm=%.3f(%s) max_vel_rps=%.3f vel_lpf_alpha=%.3f period_ms=%d",
       route.joint_name.c_str(),
       cfg.model.c_str(),
       cfg.kp,
+      std::abs(cfg.kp - kp_default) > 1e-9 ? "override" : "default",
       cfg.kd,
+      std::abs(cfg.kd - kd_default) > 1e-9 ? "override" : "default",
       cfg.tqe_nm,
+      std::abs(cfg.tqe_nm - tqe_default) > 1e-9 ? "override" : "default",
       cfg.max_velocity_rps,
       cfg.vel_lpf_alpha,
       cfg.write_period_ms);
@@ -2568,22 +2578,8 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
         }
         ++hightorque_enqueued;
       } else if (route.driver == "yiyou_can20a") {
-        if (std::abs(target - prev) > kYiyouMoveDeadbandTurns) {
-          const int32_t target_raw = static_cast<int32_t>(std::llround(target * 65536.0));
-          const auto t0 = std::chrono::steady_clock::now();
-          if (!send_yiyou_write_u32(route, 0x09, 0x00010000, "write_target_speed")) {
-            fatal_error = true;
-            break;
-          }
-          if (!send_yiyou_write_u32(route, 0x0A, target_raw, "write_target_position")) {
-            fatal_error = true;
-            break;
-          }
-          const auto t1 = std::chrono::steady_clock::now();
-          yiyou_write_us += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
-          ++yiyou_write_count;
-        }
+        std::scoped_lock<std::mutex> yy_lock(yiyou_tx_mutex_);
+        yiyou_desired_position_[route.joint_name] = target;
       }
 
       last_command_position_[route.joint_name] = target;
@@ -3119,6 +3115,50 @@ void RealMixedRobotBackend::polling_loop_yiyou()
           }
         } else {
           latest_cache_[route.joint_name] = state;
+        }
+      }
+
+      if (enabled_.load() && route.driver == "yiyou_can20a") {
+        constexpr double kYiyouSendDeadbandTurns = 2e-4;
+        constexpr double kYiyouSendMinPeriodSec = 0.02;
+        double target = std::numeric_limits<double>::quiet_NaN();
+        {
+          std::scoped_lock<std::mutex> yy_lock(yiyou_tx_mutex_);
+          const auto it = yiyou_desired_position_.find(route.joint_name);
+          if (it != yiyou_desired_position_.end()) {
+            target = it->second;
+          }
+        }
+        if (std::isfinite(target)) {
+          const double now_sec = now_monotonic_sec();
+          const double last_sent = yiyou_last_sent_position_.count(route.joint_name) ?
+            yiyou_last_sent_position_[route.joint_name] : target;
+          const double last_send_t = yiyou_last_send_time_sec_.count(route.joint_name) ?
+            yiyou_last_send_time_sec_[route.joint_name] : 0.0;
+          const bool need_send = std::abs(target - last_sent) > kYiyouSendDeadbandTurns &&
+            (now_sec - last_send_t) >= kYiyouSendMinPeriodSec;
+          if (need_send) {
+            const int32_t target_raw = static_cast<int32_t>(std::llround(target * 65536.0));
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok_speed = send_yiyou_write_u32(route, 0x09, 0x00010000, "write_target_speed");
+            const bool ok_pos = ok_speed && send_yiyou_write_u32(route, 0x0A, target_raw, "write_target_position");
+            const auto t1 = std::chrono::steady_clock::now();
+            const auto dur_us = static_cast<unsigned long>(
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+            RCLCPP_INFO_THROTTLE(
+              rclcpp::get_logger("RealMixedRobotBackend"),
+              *new rclcpp::Clock(RCL_STEADY_TIME),
+              500,
+              "YIYOU_ASYNC_WRITE joint=%s target=%.6f us=%lu result=%s",
+              route.joint_name.c_str(),
+              target,
+              dur_us,
+              ok_pos ? "ok" : "fail");
+            if (ok_pos) {
+              yiyou_last_sent_position_[route.joint_name] = target;
+              yiyou_last_send_time_sec_[route.joint_name] = now_sec;
+            }
+          }
         }
       }
     }

@@ -178,6 +178,10 @@ private:
   std::thread hightorque_tx_thread_;
   std::atomic<bool> polling_running_{false};
   std::atomic<bool> hightorque_tx_running_{false};
+  std::mutex yiyou_tx_mutex_;
+  std::unordered_map<std::string, double> yiyou_desired_position_;
+  std::unordered_map<std::string, double> yiyou_last_sent_position_;
+  std::unordered_map<std::string, double> yiyou_last_send_time_sec_;
 
   std::unordered_map<std::string, double> last_command_position_;
   std::unordered_map<std::string, double> hightorque_hold_targets_;
@@ -186,6 +190,7 @@ private:
   std::mutex hightorque_tx_mutex_;
   std::condition_variable hightorque_tx_cv_;
   std::unordered_map<std::string, HightorqueDesiredCommand> hightorque_desired_commands_;
+  std::unordered_map<std::string, bool> hightorque_hold_mode_;
   std::unordered_map<std::string, double> hightorque_last_sent_position_;
   std::unordered_map<std::string, double> hightorque_last_send_time_sec_;
   std::unordered_map<std::string, double> hightorque_filtered_velocity_;
