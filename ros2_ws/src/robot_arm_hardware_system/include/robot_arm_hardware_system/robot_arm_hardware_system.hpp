@@ -96,6 +96,7 @@ private:
   int exec_enter_required_cycles_{3};
   int exec_motion_candidate_cycles_{0};
   double hold_guard_until_sec_{0.0};
+  bool backend_step_transition_enabled_{false};
   int enable_min_stable_cycles_{3};
   int enable_wait_timeout_ms_{1500};
 

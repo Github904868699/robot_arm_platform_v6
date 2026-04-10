@@ -469,6 +469,13 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
     !hold_guard_active &&
     passes_threshold &&
     exec_motion_candidate_cycles_ >= exec_enter_required_cycles_;
+  const bool allow_step_transition = !hold_guard_active;
+  if (allow_step_transition != backend_step_transition_enabled_) {
+    backend_step_transition_enabled_ = allow_step_transition;
+    backend_->set_step_transition_enabled(
+      allow_step_transition,
+      allow_step_transition ? "hold_guard_window_passed" : "hold_guard_active");
+  }
   if (!allow_execute) {
     for (size_t i = 0; i < hold_targets_.size(); ++i) {
       hw_position_commands_[i] = hold_targets_[i];
@@ -542,6 +549,21 @@ bool RobotArmHardwareSystem::request_enable()
 
   runtime_state_ = RuntimeState::ARMING;
   set_hold_targets_from_current();  // seed backend command buffer from current readings for MIT2 hold.
+  std::vector<JointCommand> seed_commands(joint_names_.size());
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    const auto * route = router_.route_for(joint_names_[i]);
+    seed_commands[i].position = ros_position_to_backend(route, hold_targets_[i]);
+    seed_commands[i].velocity = 0.0;
+    RCLCPP_INFO(
+      rclcpp::get_logger("RobotArmHardwareSystem"),
+      "ENABLE_SEED_SYNC joint=%s ros_rad=%.6f backend_turns=%.6f seed_source=request_enable_hold_snapshot",
+      joint_names_[i].c_str(),
+      hold_targets_[i],
+      seed_commands[i].position);
+  }
+  backend_->set_hold_seed_snapshot(seed_commands, "request_enable_hold_snapshot");
+  backend_->set_step_transition_enabled(false, "request_enable_guard_active");
+  backend_step_transition_enabled_ = false;
 
   if (!backend_->enable()) {
     runtime_state_ = RuntimeState::FAULT;

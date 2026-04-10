@@ -1872,6 +1872,7 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   hightorque_joint_mit2_config_.clear();
   hightorque_position_hold_active_ = false;
   hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
   hightorque_last_step_command_sec_ = 0.0;
   write_path_warned_ = false;
   {
@@ -2594,15 +2595,24 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
         desired.valid = true;
         const bool is_step_command = target_updated || has_nonzero_velocity;
         if (is_step_command) {
-          any_hightorque_step_command = true;
-          hightorque_hold_targets_[route.joint_name] = target;
-          hightorque_last_step_command_sec_ = now_sec;
-          RCLCPP_INFO(
-            rclcpp::get_logger("RealMixedRobotBackend"),
-            "HIGHTORQUE_STEP_CMD joint=%s target_turns=%.6f vel_rps=%.6f",
-            route.joint_name.c_str(),
-            target,
-            desired.velocity_rps);
+          if (!hightorque_allow_step_transition_) {
+            RCLCPP_INFO(
+              rclcpp::get_logger("RealMixedRobotBackend"),
+              "why_step_rejected_by_guard joint=%s delta_turns=%.6f vel_rps=%.6f source=write_command",
+              route.joint_name.c_str(),
+              std::abs(target - prev),
+              desired.velocity_rps);
+          } else {
+            any_hightorque_step_command = true;
+            hightorque_hold_targets_[route.joint_name] = target;
+            hightorque_last_step_command_sec_ = now_sec;
+            RCLCPP_INFO(
+              rclcpp::get_logger("RealMixedRobotBackend"),
+              "why_step_allowed joint=%s delta_turns=%.6f vel_rps=%.6f source=write_command",
+              route.joint_name.c_str(),
+              std::abs(target - prev),
+              desired.velocity_rps);
+          }
         }
         ++hightorque_enqueued;
       } else if (route.driver == "yiyou_can20a") {
@@ -2639,7 +2649,7 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
           hightorque_hold_targets_[route.joint_name] = it->second.position_turns;
           RCLCPP_INFO(
             rclcpp::get_logger("RealMixedRobotBackend"),
-            "HIGHTORQUE_HOLD_FREEZE joint=%s target_turns=%.6f",
+            "HIGHTORQUE_HOLD_FREEZE joint=%s target_turns=%.6f source=executing_final_command",
             route.joint_name.c_str(),
             it->second.position_turns);
         }
@@ -2687,6 +2697,7 @@ bool RealMixedRobotBackend::enable()
   hightorque_mode_log_once_ = false;
   hightorque_position_hold_active_ = false;
   hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
   hightorque_last_step_command_sec_ = 0.0;
   hightorque_hold_targets_.clear();
   hightorque_hold_ready_.clear();
@@ -2781,6 +2792,7 @@ bool RealMixedRobotBackend::enable()
 
   hightorque_position_hold_active_ = true;
   hightorque_control_mode_ = HightorqueControlMode::HOLD_ACTIVE;
+  hightorque_allow_step_transition_ = false;
   enabled_ = true;
   hightorque_tx_cv_.notify_all();
   return true;
@@ -2790,6 +2802,7 @@ bool RealMixedRobotBackend::disable()
 {
   hightorque_position_hold_active_ = false;
   hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
   hightorque_last_step_command_sec_ = 0.0;
   hightorque_tx_cv_.notify_all();
   for (const auto & route : routes_) {
@@ -2832,6 +2845,7 @@ bool RealMixedRobotBackend::stop()
   }
   enabled_ = false;
   hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
   faulted_ = true;
   return ok;
 }
@@ -2840,6 +2854,66 @@ bool RealMixedRobotBackend::clear_fault()
 {
   faulted_ = false;
   return true;
+}
+
+void RealMixedRobotBackend::set_hold_seed_snapshot(
+  const std::vector<JointCommand> & commands, const std::string & source)
+{
+  if (commands.size() != routes_.size()) {
+    RCLCPP_WARN(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "set_hold_seed_snapshot: ignored size mismatch commands=%zu routes=%zu source=%s",
+      commands.size(),
+      routes_.size(),
+      source.c_str());
+    return;
+  }
+  std::scoped_lock<std::mutex> tx_lock(hightorque_tx_mutex_);
+  for (size_t i = 0; i < routes_.size(); ++i) {
+    const auto & route = routes_[i];
+    if (route.driver != "hightorque_canfd") {
+      continue;
+    }
+    const double seed = commands[i].position;
+    const double prev_hold = hightorque_hold_targets_.count(route.joint_name) ?
+      hightorque_hold_targets_[route.joint_name] : seed;
+    if (std::abs(prev_hold - seed) > 1e-4) {
+      RCLCPP_WARN(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "ENABLE_SEED_MISMATCH joint=%s old_hold_turns=%.6f new_seed_turns=%.6f source=%s",
+        route.joint_name.c_str(),
+        prev_hold,
+        seed,
+        source.c_str());
+    }
+    last_command_position_[route.joint_name] = seed;
+    hightorque_hold_targets_[route.joint_name] = seed;
+    auto & desired = hightorque_desired_commands_[route.joint_name];
+    desired.position_turns = seed;
+    desired.velocity_rps = 0.0;
+    desired.has_velocity = false;
+    desired.stamp_sec = now_monotonic_sec();
+    desired.valid = true;
+    RCLCPP_INFO(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "BACKEND_ENABLE_SEED_SYNC joint=%s backend_turns=%.6f source=%s",
+      route.joint_name.c_str(),
+      seed,
+      source.c_str());
+  }
+}
+
+void RealMixedRobotBackend::set_step_transition_enabled(bool enabled, const std::string & reason)
+{
+  if (hightorque_allow_step_transition_ == enabled) {
+    return;
+  }
+  hightorque_allow_step_transition_ = enabled;
+  RCLCPP_INFO(
+    rclcpp::get_logger("RealMixedRobotBackend"),
+    "HIGHTORQUE_STEP_TRANSITION %s reason=%s",
+    enabled ? "enabled" : "disabled",
+    reason.c_str());
 }
 
 RealMixedRobotBackend::~RealMixedRobotBackend()

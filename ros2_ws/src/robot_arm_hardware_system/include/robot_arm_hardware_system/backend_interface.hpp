@@ -23,6 +23,9 @@ public:
   virtual bool disable() = 0;
   virtual bool stop() = 0;
   virtual bool clear_fault() = 0;
+  virtual void set_hold_seed_snapshot(
+    const std::vector<JointCommand> & /*commands*/, const std::string & /*source*/) {}
+  virtual void set_step_transition_enabled(bool /*enabled*/, const std::string & /*reason*/) {}
 
   virtual std::string backend_name() const = 0;
 };

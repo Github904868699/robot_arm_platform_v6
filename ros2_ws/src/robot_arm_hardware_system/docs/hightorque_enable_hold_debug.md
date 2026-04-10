@@ -109,3 +109,23 @@
 - guard 窗口内抑制执行态切换；
 - guard 结束后，必须“超过阈值且连续满足若干周期”才进入 EXECUTING；
 - 首次进入 EXECUTING 会日志打印触发 joint、位置/速度触发值和累计周期。
+
+## 9. enable seed 对齐（本轮新增）
+- `RobotArmHardwareSystem` 在 `request_enable()` 内先生成统一 seed 快照，并打印：
+  - `ENABLE_SEED_SYNC joint=... ros_rad=... backend_turns=...`
+- 同一份 seed 通过 backend 接口 `set_hold_seed_snapshot(...)` 下发到 `RealMixedRobotBackend`，
+  对齐更新：
+  - `last_command_position_`
+  - `hightorque_hold_targets_`
+  - `hightorque_desired_commands_`
+- backend 会打印：
+  - `BACKEND_ENABLE_SEED_SYNC ...`
+  - 如发现旧值不一致：`ENABLE_SEED_MISMATCH ...`
+
+## 10. guard 期间 step 转换门控（本轮新增）
+- hardware_system 显式调用 backend `set_step_transition_enabled(false|true, reason)`，
+  不再让 backend 仅靠 target delta“猜测”。
+- guard 期间若出现 step 候选，backend 记录：
+  - `why_step_rejected_by_guard ...`
+- guard 结束后真实 step 才允许：
+  - `why_step_allowed ...`
