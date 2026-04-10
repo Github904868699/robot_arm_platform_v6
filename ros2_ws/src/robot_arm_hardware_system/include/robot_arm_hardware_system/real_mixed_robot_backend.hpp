@@ -148,8 +148,7 @@ private:
   {
     DISABLED,
     HOLD_ACTIVE,
-    TRAJECTORY_ACTIVE,
-    HOLD_PENDING_AFTER_TRAJECTORY,
+    STEP_MOVE_ACTIVE,
   };
 
   void start_polling_worker();
@@ -198,12 +197,8 @@ private:
   std::mutex hightorque_tx_mutex_;
   std::condition_variable hightorque_tx_cv_;
   std::unordered_map<std::string, HightorqueDesiredCommand> hightorque_desired_commands_;
-  std::unordered_map<std::string, bool> hightorque_hold_mode_;
-  std::unordered_map<std::string, bool> hightorque_trajectory_active_;
-  std::unordered_map<std::string, double> hightorque_hold_handoff_time_sec_;
-  std::unordered_map<std::string, double> hightorque_last_trajectory_target_;
   HightorqueControlMode hightorque_control_mode_{HightorqueControlMode::DISABLED};
-  double hightorque_hold_pending_since_sec_{0.0};
+  double hightorque_last_step_command_sec_{0.0};
   std::unordered_map<std::string, double> hightorque_last_sent_position_;
   std::unordered_map<std::string, double> hightorque_last_send_time_sec_;
   std::unordered_map<std::string, double> hightorque_filtered_velocity_;
@@ -217,6 +212,8 @@ private:
   bool hightorque_position_hold_supported_{false};
   bool hightorque_mode_log_once_{false};
   bool hightorque_position_hold_active_{false};
+  int hightorque_poll_period_ms_armed_{10};
+  int hightorque_poll_period_ms_unarmed_{10};
   double sample_recency_window_sec_{0.5};
   int sync_wait_timeout_ms_{2000};
   std::atomic<bool> enabled_{false};

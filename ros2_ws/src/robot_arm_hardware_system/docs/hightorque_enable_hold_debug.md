@@ -1,0 +1,80 @@
+# HighTorque 实机最小闭环调试说明（本轮）
+
+## 1. 本轮收敛的真实语义
+本轮只保证并建议先验证以下链路：
+
+1. `enable`
+2. `hold current position`
+3. `single-axis small step position move`
+4. `stop`
+5. `disable`
+
+不在本轮范围：多轴轨迹质量、MoveIt 跟踪优化、Web/UI。
+
+## 2. 当前 HighTorque 控制模式（最小化）
+后端模式被收敛为 3 态：
+
+- `DISABLED`
+- `HOLD_ACTIVE`
+- `STEP_MOVE_ACTIVE`
+
+切换规则（简化）：
+
+- `enable` 成功后进入 `HOLD_ACTIVE`。
+- 当收到单轴小步进命令（位置变化或非零速度）时进入 `STEP_MOVE_ACTIVE`。
+- 连续 `0.20s` 无新步进命令则回到 `HOLD_ACTIVE`，并冻结最后有效 target。
+- `stop/disable` 回到 `DISABLED`。
+
+## 3. 当前真正发送的命令语义
+- `HOLD_ACTIVE` 下发送：`semantic=hold_current_position`
+- `STEP_MOVE_ACTIVE` 下发送：`semantic=mit2_servo_cycle`
+
+两者底层都走 MIT2 位置目标帧族；`hold_current_position` 是在上层语义上明确“当前帧用于持位”。
+
+> 厂家专有 enable 帧语义是否完全等价“伺服上使能”尚未在本仓库中获得厂家文档级证据。
+> 本仓库当前以实机可观测行为 + 日志语义进行验证，请在真机上按下面步骤确认。
+
+## 4. 读写节拍与参数
+### 4.1 HighTorque 写节拍
+写周期来自：
+- `ROBOT_ARM_HT_MIT2_PERIOD_MS`（全局）
+- 或 joint override（若配置）
+
+### 4.2 HighTorque 读节拍
+新增显式轮询周期环境变量：
+- `ROBOT_ARM_HT_POLL_PERIOD_MS_ARMED`（默认 10ms）
+- `ROBOT_ARM_HT_POLL_PERIOD_MS_UNARMED`（默认 10ms）
+
+本轮改为 enabled 也默认“全关节每轮询周期都读”（取消 enabled 轮询 round-robin 降采样），
+因此每关节最慢反馈周期目标约为：
+
+`poll_period_ms_armed * high_torque_joint_count`
+
+## 5. 关键日志（真机必看）
+- `HIGHTORQUE_ENABLE_SAMPLE ... sample_age_sec=...`
+- `HIGHTORQUE_HOLD_INIT ... frozen_hold_target_turns=...`
+- `HIGHTORQUE_MODE transition HOLD_ACTIVE -> STEP_MOVE_ACTIVE`
+- `HIGHTORQUE_MODE transition STEP_MOVE_ACTIVE -> HOLD_ACTIVE ...`
+- `HIGHTORQUE_HOLD_FREEZE joint=... target_turns=...`
+- `HIGHTORQUE_MIT2_SERVO ... vel_src=hold_zero|controller|position_diff_fallback`
+- `[Hightorque][WRITE] semantic=hold_current_position|mit2_servo_cycle`
+- `hightorque_tx_loop: ... mode=HOLD_ACTIVE|STEP_MOVE_ACTIVE`
+- `polling_loop_hightorque: ... period_ms=...`
+
+## 6. 真机单轴验证建议（必须）
+1. 上电、启动、enable 后，不下发轨迹，仅观察：
+   - 是否稳定持位；
+   - 是否持续出现 `semantic=hold_current_position`。
+2. 仅对单轴（建议 joint_3）做 ±小步进（例如 ±0.01 turns）：
+   - 进入 `STEP_MOVE_ACTIVE`；
+   - 到位后约 0.2s 回到 `HOLD_ACTIVE`；
+   - 回切时不应出现突跳。
+3. 执行 `stop`：
+   - 确认 stop 帧真正下发。
+4. 执行 `disable`：
+   - 确认 disable 帧真正下发，模式回 `DISABLED`。
+
+## 7. 本轮仍未承诺
+- 未承诺已验证厂家专有 enable 帧完整语义。
+- 未承诺多轴轨迹（JTC/MoveIt）质量已达可用。
+- 未承诺 Yiyou 侧行为已同步优化。
