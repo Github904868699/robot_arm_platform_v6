@@ -29,6 +29,13 @@ double rad_to_turns(double rad)
   return rad / kTwoPi;
 }
 
+double monotonic_now_sec()
+{
+  using clock = std::chrono::steady_clock;
+  const auto now = clock::now().time_since_epoch();
+  return std::chrono::duration<double>(now).count();
+}
+
 double backend_position_to_ros(const JointRoute * route, double backend_position)
 {
   if (route == nullptr) {
@@ -135,6 +142,18 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_init(
   } else {
     auto_enable_delay_sec_ = 1.0;
   }
+  if (info_.hardware_parameters.count("hold_guard_window_sec")) {
+    hold_guard_window_sec_ = std::max(0.0, std::stod(info_.hardware_parameters.at("hold_guard_window_sec")));
+  }
+  if (info_.hardware_parameters.count("exec_enter_pos_threshold_rad")) {
+    exec_enter_pos_threshold_rad_ = std::max(1e-5, std::stod(info_.hardware_parameters.at("exec_enter_pos_threshold_rad")));
+  }
+  if (info_.hardware_parameters.count("exec_enter_vel_threshold_rad_s")) {
+    exec_enter_vel_threshold_rad_s_ = std::max(1e-5, std::stod(info_.hardware_parameters.at("exec_enter_vel_threshold_rad_s")));
+  }
+  if (info_.hardware_parameters.count("exec_enter_required_cycles")) {
+    exec_enter_required_cycles_ = std::max(1, std::stoi(info_.hardware_parameters.at("exec_enter_required_cycles")));
+  }
   if (info_.hardware_parameters.count("enable_min_stable_cycles")) {
     enable_min_stable_cycles_ = std::max(1, std::stoi(info_.hardware_parameters.at("enable_min_stable_cycles")));
   }
@@ -158,9 +177,13 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_init(
     joint_names_.size());
   RCLCPP_INFO(
     rclcpp::get_logger("RobotArmHardwareSystem"),
-    "on_init: auto_enable_on_activate=%s auto_enable_delay_sec=%.3f enable_min_stable_cycles=%d enable_wait_timeout_ms=%d",
+    "on_init: auto_enable_on_activate=%s auto_enable_delay_sec=%.3f hold_guard_window_sec=%.3f exec_enter_pos_threshold_rad=%.6f exec_enter_vel_threshold_rad_s=%.6f exec_enter_required_cycles=%d enable_min_stable_cycles=%d enable_wait_timeout_ms=%d",
     auto_enable_on_activate_ ? "true" : "false",
     auto_enable_delay_sec_,
+    hold_guard_window_sec_,
+    exec_enter_pos_threshold_rad_,
+    exec_enter_vel_threshold_rad_s_,
+    exec_enter_required_cycles_,
     enable_min_stable_cycles_,
     enable_wait_timeout_ms_);
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -388,6 +411,9 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
 
   std::vector<JointCommand> commands(joint_names_.size());
   bool trajectory_active = false;
+  std::string trigger_joint;
+  double trigger_pos_delta = 0.0;
+  double trigger_vel = 0.0;
   constexpr double kVelocityZeroEpsRad = 1e-5;
   for (size_t i = 0; i < commands.size(); ++i) {
     const auto * route = router_.route_for(joint_names_[i]);
@@ -406,6 +432,13 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
       }
       if (std::abs(hw_velocity_commands_[i]) > kVelocityZeroEpsRad || pos_delta > kMotionRejectEpsilonRad) {
         trajectory_active = true;
+        if (trigger_joint.empty() &&
+          (pos_delta > exec_enter_pos_threshold_rad_ || std::abs(hw_velocity_commands_[i]) > exec_enter_vel_threshold_rad_s_))
+        {
+          trigger_joint = joint_names_[i];
+          trigger_pos_delta = pos_delta;
+          trigger_vel = std::abs(hw_velocity_commands_[i]);
+        }
       }
     } else {
       commands[i].velocity = 0.0;
@@ -415,15 +448,57 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
         joint_names_[i].c_str());
       if (pos_delta > kMotionRejectEpsilonRad) {
         trajectory_active = true;
+        if (trigger_joint.empty() && pos_delta > exec_enter_pos_threshold_rad_) {
+          trigger_joint = joint_names_[i];
+          trigger_pos_delta = pos_delta;
+          trigger_vel = 0.0;
+        }
       }
     }
+  }
+
+  const double now_sec = monotonic_now_sec();
+  const bool hold_guard_active = now_sec < hold_guard_until_sec_;
+  const bool passes_threshold = !trigger_joint.empty();
+  if (trajectory_active && passes_threshold) {
+    ++exec_motion_candidate_cycles_;
+  } else {
+    exec_motion_candidate_cycles_ = 0;
+  }
+  const bool allow_execute =
+    !hold_guard_active &&
+    passes_threshold &&
+    exec_motion_candidate_cycles_ >= exec_enter_required_cycles_;
+  if (!allow_execute) {
+    for (size_t i = 0; i < hold_targets_.size(); ++i) {
+      hw_position_commands_[i] = hold_targets_[i];
+      hw_velocity_commands_[i] = 0.0;
+      commands[i].position = ros_position_to_backend(router_.route_for(joint_names_[i]), hw_position_commands_[i]);
+      commands[i].velocity = 0.0;
+    }
+    if (hold_guard_active && trajectory_active) {
+      static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+      RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("RobotArmHardwareSystem"),
+        steady_clock,
+        500,
+        "HOLD_GUARD active remain_sec=%.3f suppress execute pos_th=%.6f vel_th=%.6f",
+        hold_guard_until_sec_ - now_sec,
+        exec_enter_pos_threshold_rad_,
+        exec_enter_vel_threshold_rad_s_);
+    }
+    trajectory_active = false;
   }
 
   const bool was_executing = (runtime_state_ == RuntimeState::EXECUTING);
   if (!was_executing && trajectory_active) {
     RCLCPP_INFO(
       rclcpp::get_logger("RobotArmHardwareSystem"),
-      "HOLD_HANDOFF begin: ARMED_SERVO_HOLD -> EXECUTING");
+      "HOLD_HANDOFF begin: ARMED_SERVO_HOLD -> EXECUTING trigger_joint=%s pos_delta=%.6f vel=%.6f cycles=%d",
+      trigger_joint.c_str(),
+      trigger_pos_delta,
+      trigger_vel,
+      exec_motion_candidate_cycles_);
   } else if (was_executing && !trajectory_active) {
     for (size_t i = 0; i < hold_targets_.size(); ++i) {
       hold_targets_[i] = hw_position_commands_[i];
@@ -479,11 +554,14 @@ bool RobotArmHardwareSystem::request_enable()
 
   enabled_ = true;
   runtime_state_ = RuntimeState::ARMED_SERVO_HOLD;
+  exec_motion_candidate_cycles_ = 0;
+  hold_guard_until_sec_ = monotonic_now_sec() + hold_guard_window_sec_;
   RCLCPP_INFO(
     rclcpp::get_logger("RobotArmHardwareSystem"),
-    "request_enable: success enabled_=%s runtime_state_=%s",
+    "request_enable: success enabled_=%s runtime_state_=%s hold_guard_window_sec=%.3f",
     enabled_ ? "true" : "false",
-    runtime_state_name(runtime_state_));
+    runtime_state_name(runtime_state_),
+    hold_guard_window_sec_);
   return true;
 }
 

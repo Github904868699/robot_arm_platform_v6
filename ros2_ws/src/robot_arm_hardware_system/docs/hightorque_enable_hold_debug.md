@@ -50,6 +50,23 @@
 
 `poll_period_ms_armed * high_torque_joint_count`
 
+### 4.3 TX 周期控制（本轮修复重点）
+- HighTorque TX 线程不再用 `enabled==true` 作为 `wait_for` 立即返回条件。
+- 采用“deadline 驱动”的严格周期发送：每轮按 `period_ms` 推进 `next_deadline`。
+- 命令更新会触发 `command_update` 唤醒，但若尚未到 deadline，只记录并延后到周期边界发送（避免洪泛刷帧）。
+- 日志中可区分：
+  - `wake_by=periodic`
+  - `wake_by=command_update deferred_until_period`
+  - `wake_by=command_update at_period_boundary`
+
+并在统计日志中输出：
+- `configured_period_ms`
+- `avg_period_ms`
+- `tx_hz`
+- `per_joint_hz`
+- `wake_periodic`
+- `wake_command`
+
 ## 5. 关键日志（真机必看）
 - `HIGHTORQUE_ENABLE_SAMPLE ... sample_age_sec=...`
 - `HIGHTORQUE_HOLD_INIT ... frozen_hold_target_turns=...`
@@ -78,3 +95,17 @@
 - 未承诺已验证厂家专有 enable 帧完整语义。
 - 未承诺多轴轨迹（JTC/MoveIt）质量已达可用。
 - 未承诺 Yiyou 侧行为已同步优化。
+
+## 8. enable 后 HOLD GUARD（本轮新增）
+`RobotArmHardwareSystem` 在 `request_enable()` 成功后进入 hold guard 窗口，避免立刻误入 EXECUTING。
+
+可配置参数（hardware params）：
+- `hold_guard_window_sec`（默认 0.6）
+- `exec_enter_pos_threshold_rad`（默认 0.003）
+- `exec_enter_vel_threshold_rad_s`（默认 0.02）
+- `exec_enter_required_cycles`（默认 3）
+
+判定原则：
+- guard 窗口内抑制执行态切换；
+- guard 结束后，必须“超过阈值且连续满足若干周期”才进入 EXECUTING；
+- 首次进入 EXECUTING 会日志打印触发 joint、位置/速度触发值和累计周期。

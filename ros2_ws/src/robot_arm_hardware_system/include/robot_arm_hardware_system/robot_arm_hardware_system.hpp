@@ -90,6 +90,12 @@ private:
   std::string joint_mapping_path_{};
   bool auto_enable_on_activate_{false};
   double auto_enable_delay_sec_{1.0};
+  double hold_guard_window_sec_{0.6};
+  double exec_enter_pos_threshold_rad_{0.003};
+  double exec_enter_vel_threshold_rad_s_{0.02};
+  int exec_enter_required_cycles_{3};
+  int exec_motion_candidate_cycles_{0};
+  double hold_guard_until_sec_{0.0};
   int enable_min_stable_cycles_{3};
   int enable_wait_timeout_ms_{1500};
 

@@ -196,6 +196,9 @@ private:
 
   std::mutex hightorque_tx_mutex_;
   std::condition_variable hightorque_tx_cv_;
+  bool hightorque_tx_kick_{false};
+  uint64_t hightorque_tx_wakeup_command_{0};
+  uint64_t hightorque_tx_wakeup_periodic_{0};
   std::unordered_map<std::string, HightorqueDesiredCommand> hightorque_desired_commands_;
   HightorqueControlMode hightorque_control_mode_{HightorqueControlMode::DISABLED};
   double hightorque_last_step_command_sec_{0.0};

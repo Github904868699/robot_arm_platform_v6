@@ -1863,6 +1863,9 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   hightorque_filtered_velocity_.clear();
   hightorque_last_velocity_target_.clear();
   hightorque_last_velocity_target_time_sec_.clear();
+  hightorque_tx_kick_ = false;
+  hightorque_tx_wakeup_command_ = 0;
+  hightorque_tx_wakeup_periodic_ = 0;
   yiyou_desired_position_.clear();
   yiyou_last_sent_position_.clear();
   yiyou_last_send_time_sec_.clear();
@@ -2642,9 +2645,10 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
         }
       }
     }
+    hightorque_tx_kick_ = true;
   }
 
-  hightorque_tx_cv_.notify_all();
+  hightorque_tx_cv_.notify_one();
 
   if (fatal_error) {
     faulted_ = true;
@@ -2993,24 +2997,84 @@ void RealMixedRobotBackend::polling_loop_hightorque()
 void RealMixedRobotBackend::hightorque_tx_loop()
 {
   uint64_t cycle = 0;
+  auto next_deadline = std::chrono::steady_clock::now();
+  bool has_last_send = false;
+  auto last_send_tp = std::chrono::steady_clock::now();
+  double accum_period_ms = 0.0;
+  uint64_t period_samples = 0;
+
   while (hightorque_tx_running_.load()) {
     ++cycle;
 
-    std::unique_lock<std::mutex> lk(hightorque_tx_mutex_);
     int period_ms = hightorque_mit2_config_.write_period_ms;
-    for (const auto & item : hightorque_joint_mit2_config_) {
-      period_ms = std::min(period_ms, item.second.write_period_ms);
+    {
+      std::scoped_lock<std::mutex> lk(hightorque_tx_mutex_);
+      for (const auto & item : hightorque_joint_mit2_config_) {
+        period_ms = std::min(period_ms, item.second.write_period_ms);
+      }
     }
     period_ms = std::max(5, period_ms);
-    hightorque_tx_cv_.wait_for(
-      lk,
-      std::chrono::milliseconds(period_ms),
-      [this]() {return !hightorque_tx_running_.load() || !polling_running_.load() || enabled_.load();});
+    if (cycle == 1) {
+      next_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(period_ms);
+    } else {
+      next_deadline += std::chrono::milliseconds(period_ms);
+      const auto now = std::chrono::steady_clock::now();
+      if (now > next_deadline + std::chrono::milliseconds(2 * period_ms)) {
+        next_deadline = now + std::chrono::milliseconds(period_ms);
+      }
+    }
+
+    bool wake_by_command = false;
+    while (hightorque_tx_running_.load() && polling_running_.load()) {
+      std::unique_lock<std::mutex> lk(hightorque_tx_mutex_);
+      const bool woke = hightorque_tx_cv_.wait_until(
+        lk,
+        next_deadline,
+        [this]() {return !hightorque_tx_running_.load() || !polling_running_.load() || hightorque_tx_kick_;});
+      if (!hightorque_tx_running_.load() || !polling_running_.load()) {
+        break;
+      }
+      if (woke && hightorque_tx_kick_) {
+        ++hightorque_tx_wakeup_command_;
+        hightorque_tx_kick_ = false;
+        wake_by_command = true;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_deadline) {
+          static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+          RCLCPP_INFO_THROTTLE(
+            rclcpp::get_logger("RealMixedRobotBackend"),
+            steady_clock,
+            500,
+            "hightorque_tx_loop: wake_by=command_update deferred_until_period remaining_ms=%.3f",
+            std::chrono::duration<double, std::milli>(next_deadline - now).count());
+          continue;
+        }
+      } else {
+        ++hightorque_tx_wakeup_periodic_;
+      }
+      break;
+    }
 
     if (!hightorque_tx_running_.load() || !polling_running_.load()) {
       break;
     }
+    if (wake_by_command) {
+      static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+      RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        steady_clock,
+        500,
+        "hightorque_tx_loop: wake_by=command_update at_period_boundary");
+    } else {
+      static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+      RCLCPP_DEBUG_THROTTLE(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        steady_clock,
+        500,
+        "hightorque_tx_loop: wake_by=periodic");
+    }
 
+    std::unique_lock<std::mutex> lk(hightorque_tx_mutex_);
     std::vector<std::tuple<JointRoute, HightorqueDesiredCommand, HightorqueMit2Config>> jobs;
     jobs.reserve(hightorque_routes_.size());
     for (const auto & route : hightorque_routes_) {
@@ -3110,7 +3174,19 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         cfg.write_period_ms);
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (has_last_send) {
+      const double dt_ms = std::chrono::duration<double, std::milli>(now - last_send_tp).count();
+      accum_period_ms += dt_ms;
+      ++period_samples;
+    }
+    last_send_tp = now;
+    has_last_send = true;
+
     if (cycle % 100 == 0) {
+      const double avg_period_ms = period_samples > 0 ? (accum_period_ms / static_cast<double>(period_samples)) : 0.0;
+      const double tx_hz = avg_period_ms > 1e-6 ? (1000.0 / avg_period_ms) : 0.0;
+      const double per_joint_hz = tx_hz;
       const char * mode = "DISABLED";
       if (hightorque_control_mode_ == HightorqueControlMode::HOLD_ACTIVE) {
         mode = "HOLD_ACTIVE";
@@ -3119,11 +3195,17 @@ void RealMixedRobotBackend::hightorque_tx_loop()
       }
       RCLCPP_INFO(
         rclcpp::get_logger("RealMixedRobotBackend"),
-        "hightorque_tx_loop: cycle=%lu mode=%s jobs=%zu total_us=%lu",
+        "hightorque_tx_loop: cycle=%lu mode=%s jobs=%zu total_us=%lu configured_period_ms=%d avg_period_ms=%.3f tx_hz=%.2f per_joint_hz=%.2f wake_periodic=%lu wake_command=%lu",
         static_cast<unsigned long>(cycle),
         mode,
         jobs.size(),
-        static_cast<unsigned long>(cycle_us));
+        static_cast<unsigned long>(cycle_us),
+        period_ms,
+        avg_period_ms,
+        tx_hz,
+        per_joint_hz,
+        static_cast<unsigned long>(hightorque_tx_wakeup_periodic_),
+        static_cast<unsigned long>(hightorque_tx_wakeup_command_));
     }
   }
 }
