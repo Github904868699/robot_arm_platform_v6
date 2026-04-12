@@ -116,6 +116,7 @@ hardware_interface::CallbackReturn RobotArmHardwareSystem::on_init(
   joint_names_.clear();
   for (const auto & joint : info_.joints) {
     joint_names_.push_back(joint.name);
+    backend_joint_step_authorized_[joint.name] = false;
   }
 
   if (joint_names_.size() != 6) {
@@ -380,6 +381,7 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
     runtime_state_ = RuntimeState::FAULT;
     return hardware_interface::return_type::ERROR;
   }
+  static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
   if (!enabled_) {
     // READY_UNARMED and earlier states must reject motion writes.
@@ -394,7 +396,6 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
       }
     }
     if (motion_requested) {
-      static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
       RCLCPP_WARN_THROTTLE(
         rclcpp::get_logger("RobotArmHardwareSystem"),
         steady_clock,
@@ -410,11 +411,16 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
   }
 
   std::vector<JointCommand> commands(joint_names_.size());
+  std::vector<bool> joint_command_intent(joint_names_.size(), false);
   bool trajectory_active = false;
   std::string trigger_joint;
   double trigger_pos_delta = 0.0;
   double trigger_vel = 0.0;
+  bool saw_state_drift_only = false;
+  std::string drift_joint;
+  double drift_vel = 0.0;
   constexpr double kVelocityZeroEpsRad = 1e-5;
+  constexpr double kStateDriftVelEpsRad = 0.05;
   for (size_t i = 0; i < commands.size(); ++i) {
     const auto * route = router_.route_for(joint_names_[i]);
     commands[i].position = ros_position_to_backend(route, hw_position_commands_[i]);
@@ -432,6 +438,9 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
       }
       if (std::abs(hw_velocity_commands_[i]) > kVelocityZeroEpsRad || pos_delta > kMotionRejectEpsilonRad) {
         trajectory_active = true;
+        if (pos_delta > exec_enter_pos_threshold_rad_ || std::abs(hw_velocity_commands_[i]) > exec_enter_vel_threshold_rad_s_) {
+          joint_command_intent[i] = true;
+        }
         if (trigger_joint.empty() &&
           (pos_delta > exec_enter_pos_threshold_rad_ || std::abs(hw_velocity_commands_[i]) > exec_enter_vel_threshold_rad_s_))
         {
@@ -448,12 +457,20 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
         joint_names_[i].c_str());
       if (pos_delta > kMotionRejectEpsilonRad) {
         trajectory_active = true;
+        if (pos_delta > exec_enter_pos_threshold_rad_) {
+          joint_command_intent[i] = true;
+        }
         if (trigger_joint.empty() && pos_delta > exec_enter_pos_threshold_rad_) {
           trigger_joint = joint_names_[i];
           trigger_pos_delta = pos_delta;
           trigger_vel = 0.0;
         }
       }
+    }
+    if (!joint_command_intent[i] && std::abs(hw_velocities_[i]) > kStateDriftVelEpsRad) {
+      saw_state_drift_only = true;
+      drift_joint = joint_names_[i];
+      drift_vel = std::abs(hw_velocities_[i]);
     }
   }
 
@@ -495,13 +512,53 @@ hardware_interface::return_type RobotArmHardwareSystem::write(
         exec_enter_vel_threshold_rad_s_);
     }
     trajectory_active = false;
+    if (saw_state_drift_only && !passes_threshold) {
+      RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("RobotArmHardwareSystem"),
+        steady_clock,
+        500,
+        "enter EXECUTING reason=state_drift blocked joint=%s drift_vel=%.6f",
+        drift_joint.c_str(),
+        drift_vel);
+    }
+  }
+
+  bool any_hightorque_authorized = false;
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    const auto * route = router_.route_for(joint_names_[i]);
+    if (route == nullptr || route->driver != "hightorque_canfd") {
+      continue;
+    }
+    const bool desired_auth = allow_execute && joint_command_intent[i];
+    if (backend_joint_step_authorized_[joint_names_[i]] != desired_auth) {
+      backend_joint_step_authorized_[joint_names_[i]] = desired_auth;
+      backend_->set_step_transition_for_joint(
+        joint_names_[i],
+        desired_auth,
+        desired_auth ? "command_intent_detected" : "no_command_intent_or_guard");
+    }
+    any_hightorque_authorized = any_hightorque_authorized || desired_auth;
+    if (!desired_auth && allow_execute) {
+      RCLCPP_DEBUG_THROTTLE(
+        rclcpp::get_logger("RobotArmHardwareSystem"),
+        steady_clock,
+        500,
+        "hightorque joint hold enforced joint=%s reason=no_real_command_intent",
+        joint_names_[i].c_str());
+    }
+  }
+  if (allow_execute && !any_hightorque_authorized && !trigger_joint.empty()) {
+    RCLCPP_INFO(
+      rclcpp::get_logger("RobotArmHardwareSystem"),
+      "enter EXECUTING reason=command_change trigger_joint=%s without_hightorque_step_authorization",
+      trigger_joint.c_str());
   }
 
   const bool was_executing = (runtime_state_ == RuntimeState::EXECUTING);
   if (!was_executing && trajectory_active) {
     RCLCPP_INFO(
       rclcpp::get_logger("RobotArmHardwareSystem"),
-      "HOLD_HANDOFF begin: ARMED_SERVO_HOLD -> EXECUTING trigger_joint=%s pos_delta=%.6f vel=%.6f cycles=%d",
+      "HOLD_HANDOFF begin: ARMED_SERVO_HOLD -> EXECUTING reason=command_change trigger_joint=%s pos_delta=%.6f vel=%.6f cycles=%d",
       trigger_joint.c_str(),
       trigger_pos_delta,
       trigger_vel,

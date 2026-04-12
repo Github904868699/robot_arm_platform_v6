@@ -129,3 +129,10 @@
   - `why_step_rejected_by_guard ...`
 - guard 结束后真实 step 才允许：
   - `why_step_allowed ...`
+
+## 11. 按关节 step 授权（本轮新增）
+- backend step 授权不再是“全局一把闸”，而是按关节：
+  - `set_step_transition_for_joint(joint, enabled, reason)`
+- 日志：
+  - `step authorization state changed joint=... enabled=... reason=...`
+- 即便系统进入 EXECUTING，若某个 HighTorque joint 没有真实 command intent，也会被明确保持 hold。

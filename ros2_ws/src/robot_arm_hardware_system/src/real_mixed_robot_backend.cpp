@@ -1873,6 +1873,7 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   hightorque_position_hold_active_ = false;
   hightorque_control_mode_ = HightorqueControlMode::DISABLED;
   hightorque_allow_step_transition_ = false;
+  hightorque_step_authorized_.clear();
   hightorque_last_step_command_sec_ = 0.0;
   write_path_warned_ = false;
   {
@@ -2594,14 +2595,19 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
         desired.stamp_sec = now_sec;
         desired.valid = true;
         const bool is_step_command = target_updated || has_nonzero_velocity;
+        const bool joint_step_authorized = hightorque_allow_step_transition_ &&
+          (hightorque_step_authorized_.count(route.joint_name) ? hightorque_step_authorized_[route.joint_name] : false);
         if (is_step_command) {
-          if (!hightorque_allow_step_transition_) {
+          if (!joint_step_authorized) {
             RCLCPP_INFO(
               rclcpp::get_logger("RealMixedRobotBackend"),
               "why_step_rejected_by_guard joint=%s delta_turns=%.6f vel_rps=%.6f source=write_command",
               route.joint_name.c_str(),
               std::abs(target - prev),
               desired.velocity_rps);
+            desired.position_turns = hightorque_hold_targets_[route.joint_name];
+            desired.velocity_rps = 0.0;
+            desired.has_velocity = false;
           } else {
             any_hightorque_step_command = true;
             hightorque_hold_targets_[route.joint_name] = target;
@@ -2913,6 +2919,23 @@ void RealMixedRobotBackend::set_step_transition_enabled(bool enabled, const std:
     rclcpp::get_logger("RealMixedRobotBackend"),
     "HIGHTORQUE_STEP_TRANSITION %s reason=%s",
     enabled ? "enabled" : "disabled",
+    reason.c_str());
+}
+
+void RealMixedRobotBackend::set_step_transition_for_joint(
+  const std::string & joint_name, bool enabled, const std::string & reason)
+{
+  const bool prev = hightorque_step_authorized_.count(joint_name) ?
+    hightorque_step_authorized_[joint_name] : false;
+  if (prev == enabled) {
+    return;
+  }
+  hightorque_step_authorized_[joint_name] = enabled;
+  RCLCPP_INFO(
+    rclcpp::get_logger("RealMixedRobotBackend"),
+    "step authorization state changed joint=%s enabled=%s reason=%s",
+    joint_name.c_str(),
+    enabled ? "true" : "false",
     reason.c_str());
 }
 

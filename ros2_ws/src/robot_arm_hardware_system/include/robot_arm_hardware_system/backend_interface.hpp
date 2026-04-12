@@ -26,6 +26,8 @@ public:
   virtual void set_hold_seed_snapshot(
     const std::vector<JointCommand> & /*commands*/, const std::string & /*source*/) {}
   virtual void set_step_transition_enabled(bool /*enabled*/, const std::string & /*reason*/) {}
+  virtual void set_step_transition_for_joint(
+    const std::string & /*joint_name*/, bool /*enabled*/, const std::string & /*reason*/) {}
 
   virtual std::string backend_name() const = 0;
 };

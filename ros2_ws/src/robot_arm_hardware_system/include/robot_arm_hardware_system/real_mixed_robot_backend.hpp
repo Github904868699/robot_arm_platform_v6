@@ -143,6 +143,8 @@ public:
   void set_hold_seed_snapshot(
     const std::vector<JointCommand> & commands, const std::string & source) override;
   void set_step_transition_enabled(bool enabled, const std::string & reason) override;
+  void set_step_transition_for_joint(
+    const std::string & joint_name, bool enabled, const std::string & reason) override;
 
   std::string backend_name() const override { return "real_mixed_readonly_placeholder"; }
 
@@ -205,6 +207,7 @@ private:
   std::unordered_map<std::string, HightorqueDesiredCommand> hightorque_desired_commands_;
   HightorqueControlMode hightorque_control_mode_{HightorqueControlMode::DISABLED};
   bool hightorque_allow_step_transition_{false};
+  std::unordered_map<std::string, bool> hightorque_step_authorized_;
   double hightorque_last_step_command_sec_{0.0};
   std::unordered_map<std::string, double> hightorque_last_sent_position_;
   std::unordered_map<std::string, double> hightorque_last_send_time_sec_;

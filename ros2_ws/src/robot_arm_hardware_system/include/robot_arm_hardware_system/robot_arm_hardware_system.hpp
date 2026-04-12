@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "hardware_interface/system_interface.hpp"
@@ -97,6 +98,7 @@ private:
   int exec_motion_candidate_cycles_{0};
   double hold_guard_until_sec_{0.0};
   bool backend_step_transition_enabled_{false};
+  std::unordered_map<std::string, bool> backend_joint_step_authorized_;
   int enable_min_stable_cycles_{3};
   int enable_wait_timeout_ms_{1500};
 
