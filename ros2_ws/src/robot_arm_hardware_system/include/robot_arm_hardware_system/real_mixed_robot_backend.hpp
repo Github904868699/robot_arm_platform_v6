@@ -8,10 +8,12 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "robot_arm_hardware_system/backend_interface.hpp"
 
@@ -32,6 +34,8 @@ struct HightorqueMit2Config
 struct HightorqueDesiredCommand
 {
   double position_turns{0.0};
+  double velocity_rps{0.0};
+  bool has_velocity{false};
   double stamp_sec{0.0};
   bool valid{false};
 };
@@ -136,16 +140,32 @@ public:
   bool disable() override;
   bool stop() override;
   bool clear_fault() override;
+  void set_hold_seed_snapshot(
+    const std::vector<JointCommand> & commands, const std::string & source) override;
+  void set_step_transition_enabled(bool enabled, const std::string & reason) override;
+  void set_step_transition_for_joint(
+    const std::string & joint_name, bool enabled, const std::string & reason) override;
 
   std::string backend_name() const override { return "real_mixed_readonly_placeholder"; }
 
 private:
+  enum class HightorqueControlMode
+  {
+    DISABLED,
+    HOLD_ACTIVE,
+    STEP_MOVE_ACTIVE,
+  };
+
   void start_polling_worker();
   void stop_polling_worker();
   void polling_loop_hightorque();
   void polling_loop_yiyou();
   void hightorque_tx_loop();
   void write_cache_locked(const std::string & joint_name, const JointState & state);
+  bool resolve_bridge_devices();
+  bool probe_hightorque_on_device(const std::string & device, const std::set<int> & node_ids);
+  bool probe_yiyou_on_device(const std::string & device, int node_id);
+  bool get_recent_last_good_state(const std::string & joint_name, JointState & out_state, double max_age_sec);
 
   bool discover_hightorque_joints();
   bool discover_yiyou_joints();
@@ -161,12 +181,19 @@ private:
   HightorqueReadChannel hightorque_channel_;
   YiyouReadChannel yiyou_channel_;
   std::unordered_map<std::string, JointState> latest_cache_;
+  std::unordered_map<std::string, JointState> latest_poll_result_;
+  std::unordered_map<std::string, JointState> last_good_cache_;
+  std::unordered_map<std::string, double> last_good_time_sec_;
   std::mutex cache_mutex_;
   std::thread hightorque_polling_thread_;
   std::thread yiyou_polling_thread_;
   std::thread hightorque_tx_thread_;
   std::atomic<bool> polling_running_{false};
   std::atomic<bool> hightorque_tx_running_{false};
+  std::mutex yiyou_tx_mutex_;
+  std::unordered_map<std::string, double> yiyou_desired_position_;
+  std::unordered_map<std::string, double> yiyou_last_sent_position_;
+  std::unordered_map<std::string, double> yiyou_last_send_time_sec_;
 
   std::unordered_map<std::string, double> last_command_position_;
   std::unordered_map<std::string, double> hightorque_hold_targets_;
@@ -174,7 +201,14 @@ private:
 
   std::mutex hightorque_tx_mutex_;
   std::condition_variable hightorque_tx_cv_;
+  bool hightorque_tx_kick_{false};
+  uint64_t hightorque_tx_wakeup_command_{0};
+  uint64_t hightorque_tx_wakeup_periodic_{0};
   std::unordered_map<std::string, HightorqueDesiredCommand> hightorque_desired_commands_;
+  HightorqueControlMode hightorque_control_mode_{HightorqueControlMode::DISABLED};
+  bool hightorque_allow_step_transition_{false};
+  std::unordered_map<std::string, bool> hightorque_step_authorized_;
+  double hightorque_last_step_command_sec_{0.0};
   std::unordered_map<std::string, double> hightorque_last_sent_position_;
   std::unordered_map<std::string, double> hightorque_last_send_time_sec_;
   std::unordered_map<std::string, double> hightorque_filtered_velocity_;
@@ -188,6 +222,10 @@ private:
   bool hightorque_position_hold_supported_{false};
   bool hightorque_mode_log_once_{false};
   bool hightorque_position_hold_active_{false};
+  int hightorque_poll_period_ms_armed_{10};
+  int hightorque_poll_period_ms_unarmed_{10};
+  double sample_recency_window_sec_{0.5};
+  int sync_wait_timeout_ms_{2000};
   std::atomic<bool> enabled_{false};
   std::atomic<bool> faulted_{false};
 };

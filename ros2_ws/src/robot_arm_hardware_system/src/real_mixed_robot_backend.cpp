@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/ioctl.h>
@@ -121,6 +122,15 @@ bool is_hightorque_bridge_ack(const std::string & raw)
       return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
     };
   return is_hex(token[1]) && token[2] == '0' && token[3] == '0' && token[4] == '0';
+}
+
+uint8_t hightorque_node_id_from_can_id(uint32_t can_id)
+{
+  const uint8_t node_hi = static_cast<uint8_t>((can_id >> 8) & 0xFFu);
+  if (node_hi != 0) {
+    return node_hi;
+  }
+  return static_cast<uint8_t>(can_id & 0xFFu);
 }
 
 std::string to_hex_upper(uint32_t value, int width)
@@ -302,14 +312,9 @@ std::string build_slcan_D_frame(uint32_t can_id, const std::vector<uint8_t> & da
 
 std::string build_hightorque_read_query(const JointRoute & route)
 {
-  // HighTorque CAN-FD read command family uses `D...` (verified manually).
-  // Use full CAN-FD bridge frame style (DLC=A => 16-byte payload),
-  // aligned with manually verified successful D... framing characteristics.
-  // Minimal state-read core payload: 0x01 0x00 0x00 0x14 0x04 0x00 0x11 0x0F
-  // then pad/fill to 16 bytes with 0x50 0x50 tail marker.
+  // Official H730 read_motor_state_int32: payload={0x18,0x04,0x00,0x11,0x0F}.
   const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-  return build_slcan_D_frame(
-    can_id, {0x01, 0x00, 0x00, 0x14, 0x04, 0x00, 0x11, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x50});
+  return build_slcan_D_frame(can_id, {0x18, 0x04, 0x00, 0x11, 0x0F});
 }
 
 std::string build_hightorque_full_status_query(const JointRoute & route)
@@ -371,24 +376,82 @@ bool parse_hightorque_full_status(
   std::string & reason,
   uint32_t & can_id_out)
 {
-  std::vector<uint8_t> payload;
-  if (!parse_slcan_D_payload(raw, payload, can_id_out, reason)) {
+  std::vector<std::pair<uint32_t, std::vector<uint8_t>>> frames;
+  {
+    size_t cursor = 0;
+    while (cursor < raw.size()) {
+      const size_t d_pos = raw.find_first_of("DdBb", cursor);
+      if (d_pos == std::string::npos) {
+        break;
+      }
+      const bool is_extended = (raw[d_pos] == 'D' || raw[d_pos] == 'B');
+      const bool is_canfd = (raw[d_pos] == 'D' || raw[d_pos] == 'd');
+      const size_t can_id_hex_len = is_extended ? 8 : 3;
+      if (!is_canfd || d_pos + 1 + can_id_hex_len + 1 > raw.size()) {
+        cursor = d_pos + 1;
+        continue;
+      }
+      try {
+        const uint32_t parsed_can_id = static_cast<uint32_t>(
+          std::stoul(raw.substr(d_pos + 1, can_id_hex_len), nullptr, 16));
+        const unsigned int dlc_code = static_cast<unsigned int>(
+          std::stoul(raw.substr(d_pos + 1 + can_id_hex_len, 1), nullptr, 16) & 0x0Fu);
+        const size_t payload_len = [] (unsigned int dlc) -> size_t {
+            switch (dlc & 0x0Fu) {
+              case 0x0: return 0;
+              case 0x1: return 1;
+              case 0x2: return 2;
+              case 0x3: return 3;
+              case 0x4: return 4;
+              case 0x5: return 5;
+              case 0x6: return 6;
+              case 0x7: return 7;
+              case 0x8: return 8;
+              case 0x9: return 12;
+              case 0xA: return 16;
+              case 0xB: return 20;
+              case 0xC: return 24;
+              case 0xD: return 32;
+              case 0xE: return 48;
+              case 0xF: return 64;
+              default: return 0;
+            }
+          }(dlc_code);
+        const size_t payload_hex_pos = d_pos + 1 + can_id_hex_len + 1;
+        const size_t need_len = payload_hex_pos + payload_len * 2;
+        if (need_len > raw.size()) {
+          cursor = d_pos + 1;
+          continue;
+        }
+        std::vector<uint8_t> payload;
+        payload.reserve(payload_len);
+        for (size_t i = 0; i < payload_len; ++i) {
+          payload.push_back(static_cast<uint8_t>(
+            std::stoul(raw.substr(payload_hex_pos + i * 2, 2), nullptr, 16) & 0xFFu));
+        }
+        frames.emplace_back(parsed_can_id, std::move(payload));
+        cursor = need_len;
+      } catch (...) {
+        cursor = d_pos + 1;
+      }
+    }
+  }
+  if (frames.empty()) {
+    reason = "short_reply";
     return false;
   }
 
-  const auto le_i16 = [&](size_t off) -> int16_t {
-      return static_cast<int16_t>(
-        static_cast<uint16_t>(payload[off]) |
-        (static_cast<uint16_t>(payload[off + 1]) << 8));
+  const auto le_i16 = [&](const std::vector<uint8_t> & payload, size_t off) -> int16_t {
+      return static_cast<int16_t>(static_cast<uint16_t>(payload[off]) | (static_cast<uint16_t>(payload[off + 1]) << 8));
     };
-  const auto le_i32 = [&](size_t off) -> int32_t {
+  const auto le_i32 = [&](const std::vector<uint8_t> & payload, size_t off) -> int32_t {
       return static_cast<int32_t>(
         static_cast<uint32_t>(payload[off]) |
         (static_cast<uint32_t>(payload[off + 1]) << 8) |
         (static_cast<uint32_t>(payload[off + 2]) << 16) |
         (static_cast<uint32_t>(payload[off + 3]) << 24));
     };
-  const auto le_f32 = [&](size_t off) -> float {
+  const auto le_f32 = [&](const std::vector<uint8_t> & payload, size_t off) -> float {
       uint32_t u =
         static_cast<uint32_t>(payload[off]) |
         (static_cast<uint32_t>(payload[off + 1]) << 8) |
@@ -403,59 +466,57 @@ bool parse_hightorque_full_status(
   // [0]=0x24 [1]=0x04 [2]=0x00 [3]=mode
   // [5:7]=pos_i16_le /10000, [7:9]=vel_i16_le /4000
   // [11]=0x21 [12]=0x0F [13]=fault
-  if (
-    payload.size() >= 14 &&
-    payload[0] == 0x24 && payload[1] == 0x04 && payload[2] == 0x00 &&
-    payload[11] == 0x21 && payload[12] == 0x0F)
-  {
-    const int16_t pos_i16 = le_i16(5);
-    const int16_t vel_i16 = le_i16(7);
-    pos_out = static_cast<double>(pos_i16) / 10000.0;
-    vel_out = static_cast<double>(vel_i16) / 4000.0;
-    reason = "parsed_ok_tint16";
-    return true;
-  }
-
-  // TINT32 variant:
-  // [0]=0x28 [1]=0x04 [2]=0x00 [3]=mode
-  // [7:11]=pos_i32_le /100000, [11:15]=vel_i32_le /100000
-  // [19]=0x21 [20]=0x0F [21]=fault
-  if (
-    payload.size() >= 22 &&
-    payload[0] == 0x28 && payload[1] == 0x04 && payload[2] == 0x00 &&
-    payload[19] == 0x21 && payload[20] == 0x0F)
-  {
-    const int32_t pos_i32 = le_i32(7);
-    const int32_t vel_i32 = le_i32(11);
-    pos_out = static_cast<double>(pos_i32) / 100000.0;
-    vel_out = static_cast<double>(vel_i32) / 100000.0;
-    reason = "parsed_ok_tint32";
-    return true;
-  }
-
-  // TFLOAT variant:
-  // [0]=0x2C [1]=0x04 [2]=0x00 [3]=mode
-  // [7:11]=pos_f32_le turns, [11:15]=vel_f32_le rps
-  // [19]=0x21 [20]=0x0F [21]=fault
-  if (
-    payload.size() >= 22 &&
-    payload[0] == 0x2C && payload[1] == 0x04 && payload[2] == 0x00 &&
-    payload[19] == 0x21 && payload[20] == 0x0F)
-  {
-    const float pos_f32 = le_f32(7);
-    const float vel_f32 = le_f32(11);
-    if (std::isfinite(pos_f32) && std::isfinite(vel_f32)) {
-      pos_out = static_cast<double>(pos_f32);
-      vel_out = static_cast<double>(vel_f32);
-      reason = "parsed_ok_tfloat";
+  for (const auto & frame : frames) {
+    const auto & payload = frame.second;
+    can_id_out = frame.first;
+    if (
+      payload.size() >= 14 &&
+      payload[0] == 0x24 && payload[1] == 0x04 && payload[2] == 0x00 &&
+      payload[11] == 0x21 && payload[12] == 0x0F)
+    {
+      const int16_t pos_i16 = le_i16(payload, 5);
+      const int16_t vel_i16 = le_i16(payload, 7);
+      pos_out = static_cast<double>(pos_i16) / 10000.0;
+      vel_out = static_cast<double>(vel_i16) / 4000.0;
+      reason = "parsed_ok_tint16";
       return true;
     }
-    reason = "non_finite_tfloat";
-    return false;
+    if (
+      payload.size() >= 22 &&
+      payload[0] == 0x28 && payload[1] == 0x04 && payload[2] == 0x00 &&
+      payload[19] == 0x21 && payload[20] == 0x0F)
+    {
+      const int32_t pos_i32 = le_i32(payload, 7);
+      const int32_t vel_i32 = le_i32(payload, 11);
+      pos_out = static_cast<double>(pos_i32) / 100000.0;
+      vel_out = static_cast<double>(vel_i32) / 100000.0;
+      reason = "parsed_ok_tint32";
+      return true;
+    }
+    if (
+      payload.size() >= 22 &&
+      payload[0] == 0x2C && payload[1] == 0x04 && payload[2] == 0x00 &&
+      payload[19] == 0x21 && payload[20] == 0x0F)
+    {
+      const float pos_f32 = le_f32(payload, 7);
+      const float vel_f32 = le_f32(payload, 11);
+      if (std::isfinite(pos_f32) && std::isfinite(vel_f32)) {
+        pos_out = static_cast<double>(pos_f32);
+        vel_out = static_cast<double>(vel_f32);
+        reason = "parsed_ok_tfloat";
+        return true;
+      }
+    }
   }
 
-  reason = "unknown_hightorque_payload_format";
+  reason = "unknown_hightorque_payload_format_or_ack_only";
   return false;
+}
+
+bool is_state_sample_good(const JointState & state)
+{
+  return state.available && state.online && !state.stale &&
+         std::isfinite(state.position) && std::isfinite(state.velocity);
 }
 
 double hightorque_model_k(const std::string & model)
@@ -710,15 +771,13 @@ struct LegacyProtocolDeviceActions final
   // NOTE: currently not wired into write path; kept to define action boundary.
   static std::string hightorque_stop(const JointRoute & route)
   {
-    const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-    return build_slcan_D_frame(can_id, {0x01, 0x00, 0x00, 0x14, 0x04, 0x00, 0x11, 0x0F});
+    return build_hightorque_stop_int32(route);
   }
 
   // NOTE: currently not wired into write path; kept to define action boundary.
   static std::string hightorque_brake(const JointRoute & route)
   {
-    const uint32_t can_id = 0x8000u | static_cast<uint32_t>(route.node_id & 0xFF);
-    return build_slcan_D_frame(can_id, {0x01, 0x00, 0x0F, 0x14, 0x04, 0x00, 0x11, 0x0F});
+    return build_hightorque_brake_int32(route);
   }
 
   // NOTE: currently not wired into write path; kept to define action boundary.
@@ -1408,7 +1467,7 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
   reset_input_buffer_only("Hightorque", fd);
   // Legacy protocol path: temporary C++ action boundary call.
   const std::string query = LegacyProtocolDeviceActions::hightorque_query(route);
-  if (!send_query("Hightorque", fd, query, send_failures, read_attempts)) {
+  if (!send_query("Hightorque", fd, query, send_failures, read_attempts, false)) {
     clear_inflight(query_inflight);
     return true;
   }
@@ -1444,14 +1503,16 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
       raw.size(),
       hex_digest(raw).c_str(),
       ascii_escaped(raw).c_str());
-    const std::string full_status_query = LegacyProtocolDeviceActions::hightorque_query_full_status(route);
+    // Official read path already uses read_motor_state_int32 query frame.
+    // If bridge returns short ACK only, retry the same official query once.
+    const std::string full_status_query = LegacyProtocolDeviceActions::hightorque_query(route);
     RCLCPP_INFO(
       rclcpp::get_logger("RealMixedRobotBackend"),
       "[Hightorque] full_status_query tx ascii_escaped='%s' tx_hex=%s tx_len=%zu",
       ascii_escaped(full_status_query).c_str(),
       hex_digest(full_status_query).c_str(),
       full_status_query.size());
-    if (!send_query("Hightorque", fd, full_status_query, send_failures, read_attempts)) {
+    if (!send_query("Hightorque", fd, full_status_query, send_failures, read_attempts, false)) {
       clear_inflight(query_inflight);
       return true;
     }
@@ -1496,13 +1557,36 @@ bool HightorqueReadChannel::read_joint(const JointRoute & route, JointState & ou
     return true;
   }
 
+  const uint8_t parsed_node_id = hightorque_node_id_from_can_id(parsed_can_id);
+  if (parsed_node_id == 0) {
+    ++parse_failures;
+    RCLCPP_WARN(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "[Hightorque] classify=node_reject reason=node_id_zero route_node=%d raw_hex=%s",
+      route.node_id,
+      hex_digest(raw).c_str());
+    clear_inflight(query_inflight);
+    return true;
+  }
+  if (parsed_node_id != static_cast<uint8_t>(route.node_id & 0xFF)) {
+    ++parse_failures;
+    RCLCPP_WARN(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "[Hightorque] classify=node_reject reason=node_mismatch parsed_node=%u route_node=%d raw_hex=%s",
+      static_cast<unsigned int>(parsed_node_id),
+      route.node_id,
+      hex_digest(raw).c_str());
+    clear_inflight(query_inflight);
+    return true;
+  }
+
   out_state.position = parsed_pos;
   out_state.velocity = parsed_vel;
   out_state.available = true;
   RCLCPP_INFO(
     rclcpp::get_logger("RealMixedRobotBackend"),
     "[Hightorque] parsed state classify=parsed_ok node_id=0x%X position=%.6f velocity=%.6f available=true online=true",
-    static_cast<unsigned int>(parsed_can_id & 0xFF),
+    static_cast<unsigned int>(parsed_node_id),
     out_state.position,
     out_state.velocity);
   ++valid_samples;
@@ -1694,7 +1778,7 @@ bool YiyouReadChannel::read_joint(const JointRoute & route, JointState & out_sta
         reg_name,
         ascii_escaped(query).c_str(),
         hex_digest(query).c_str());
-      if (!send_query("Yiyou", fd, query, send_failures, read_attempts)) {
+      if (!send_query("Yiyou", fd, query, send_failures, read_attempts, false)) {
         return false;
       }
       std::string raw;
@@ -1779,12 +1863,25 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   hightorque_filtered_velocity_.clear();
   hightorque_last_velocity_target_.clear();
   hightorque_last_velocity_target_time_sec_.clear();
+  hightorque_tx_kick_ = false;
+  hightorque_tx_wakeup_command_ = 0;
+  hightorque_tx_wakeup_periodic_ = 0;
+  yiyou_desired_position_.clear();
+  yiyou_last_sent_position_.clear();
+  yiyou_last_send_time_sec_.clear();
   hightorque_joint_mit2_config_.clear();
   hightorque_position_hold_active_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
+  hightorque_step_authorized_.clear();
+  hightorque_last_step_command_sec_ = 0.0;
   write_path_warned_ = false;
   {
     std::scoped_lock<std::mutex> lock(cache_mutex_);
     latest_cache_.clear();
+    latest_poll_result_.clear();
+    last_good_cache_.clear();
+    last_good_time_sec_.clear();
     for (const auto & route : routes_) {
       JointState s{};
       s.online = false;
@@ -1793,6 +1890,7 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
       s.source = "init_default";
       s.last_error = "no_sample_yet";
       latest_cache_[route.joint_name] = s;
+      latest_poll_result_[route.joint_name] = s;
 
       if (route.driver == "hightorque_canfd") {
         hightorque_routes_.push_back(route);
@@ -1828,10 +1926,36 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
   if (const char * v = std::getenv("ROBOT_ARM_HT_MIT2_PERIOD_MS")) {
     hightorque_mit2_config_.write_period_ms = std::max(5, std::atoi(v));
   }
+  if (const char * v = std::getenv("ROBOT_ARM_SAMPLE_RECENCY_WINDOW_SEC")) {
+    sample_recency_window_sec_ = std::max(0.05, std::atof(v));
+  }
+  if (const char * v = std::getenv("ROBOT_ARM_SYNC_WAIT_TIMEOUT_MS")) {
+    sync_wait_timeout_ms_ = std::max(100, std::atoi(v));
+  }
+  if (const char * v = std::getenv("ROBOT_ARM_HT_POLL_PERIOD_MS_ARMED")) {
+    hightorque_poll_period_ms_armed_ = std::max(5, std::atoi(v));
+  }
+  if (const char * v = std::getenv("ROBOT_ARM_HT_POLL_PERIOD_MS_UNARMED")) {
+    hightorque_poll_period_ms_unarmed_ = std::max(5, std::atoi(v));
+  }
+
+  if (const char * v = std::getenv("ROBOT_ARM_HT_BRIDGE_DEVICE")) {
+    if (std::strlen(v) > 0) {
+      hightorque_channel_.bridge_device = std::string(v);
+    }
+  }
+  if (const char * v = std::getenv("ROBOT_ARM_YIYOU_BRIDGE_DEVICE")) {
+    if (std::strlen(v) > 0) {
+      yiyou_channel_.bridge_device = std::string(v);
+    }
+  }
 
   for (const auto & route : hightorque_routes_) {
     auto cfg = hightorque_mit2_config_;
     maybe_override_joint_mit2_model(route.joint_name, cfg.model);
+    const double kp_default = cfg.kp;
+    const double kd_default = cfg.kd;
+    const double tqe_default = cfg.tqe_nm;
     maybe_override_joint_mit2_param(route.joint_name, "KP", cfg.kp);
     maybe_override_joint_mit2_param(route.joint_name, "KD", cfg.kd);
     maybe_override_joint_mit2_param(route.joint_name, "TQE_NM", cfg.tqe_nm);
@@ -1841,12 +1965,15 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
     hightorque_joint_mit2_config_[route.joint_name] = cfg;
     RCLCPP_INFO(
       rclcpp::get_logger("RealMixedRobotBackend"),
-      "HIGHTORQUE_MIT2_CONFIG joint=%s model=%s kp=%.3f kd=%.3f tqe_nm=%.3f max_vel_rps=%.3f vel_lpf_alpha=%.3f period_ms=%d",
+      "HIGHTORQUE_MIT2_CONFIG joint=%s model=%s kp=%.3f(%s) kd=%.3f(%s) tqe_nm=%.3f(%s) max_vel_rps=%.3f vel_lpf_alpha=%.3f period_ms=%d",
       route.joint_name.c_str(),
       cfg.model.c_str(),
       cfg.kp,
+      std::abs(cfg.kp - kp_default) > 1e-9 ? "override" : "default",
       cfg.kd,
+      std::abs(cfg.kd - kd_default) > 1e-9 ? "override" : "default",
       cfg.tqe_nm,
+      std::abs(cfg.tqe_nm - tqe_default) > 1e-9 ? "override" : "default",
       cfg.max_velocity_rps,
       cfg.vel_lpf_alpha,
       cfg.write_period_ms);
@@ -1871,6 +1998,12 @@ bool RealMixedRobotBackend::configure(const JointRouteTable & routes)
     "configure: hightorque debug_single_joint=%s debug_joint_name=%s",
     hightorque_channel_.debug_single_joint ? "true" : "false",
     hightorque_channel_.debug_joint_name.c_str());
+  RCLCPP_INFO(
+    rclcpp::get_logger("RealMixedRobotBackend"),
+    "HIGHTORQUE_TIMING_CONFIG poll_period_ms_armed=%d poll_period_ms_unarmed=%d per_joint_feedback_budget_ms<=%d",
+    hightorque_poll_period_ms_armed_,
+    hightorque_poll_period_ms_unarmed_,
+    hightorque_poll_period_ms_armed_ * static_cast<int>(std::max<size_t>(1, hightorque_routes_.size())));
   return routes_.size() == 6;
 }
 
@@ -1878,6 +2011,12 @@ bool RealMixedRobotBackend::discover_joints()
 {
   discovered_.clear();
   RCLCPP_INFO(rclcpp::get_logger("RealMixedRobotBackend"), "discover_joints: begin");
+
+  if (!resolve_bridge_devices()) {
+    RCLCPP_ERROR(rclcpp::get_logger("RealMixedRobotBackend"), "discover_joints: resolve_bridge_devices failed");
+    faulted_ = true;
+    return false;
+  }
 
   if (!discover_hightorque_joints()) {
     RCLCPP_ERROR(rclcpp::get_logger("RealMixedRobotBackend"), "discover_joints: hightorque discover failed");
@@ -1917,18 +2056,234 @@ bool RealMixedRobotBackend::discover_joints()
   return true;
 }
 
+bool RealMixedRobotBackend::probe_hightorque_on_device(const std::string & device, const std::set<int> & node_ids)
+{
+  int fd = -1;
+  bool initialized = false;
+  if (!ensure_open("HightorqueProbe", device, fd, initialized, {"C\r", "S8\r", "Y5\r", "M0\r", "A1\r", "O\r"})) {
+    return false;
+  }
+  bool ok = false;
+  for (const int node_id : node_ids) {
+    JointRoute route{};
+    route.node_id = node_id;
+    const std::string query = build_hightorque_read_query(route);
+    uint64_t send_fail = 0;
+    uint64_t read_timeout = 0;
+    if (!send_query("HightorqueProbe", fd, query, send_fail, 1)) {
+      continue;
+    }
+    std::string raw;
+    if (!read_raw_frame(fd, raw, read_timeout, "HightorqueProbe", 1) || raw.empty()) {
+      continue;
+    }
+    double pos = 0.0;
+    double vel = 0.0;
+    uint32_t can_id = 0;
+    std::string reason;
+    if (!parse_hightorque_full_status(raw, pos, vel, reason, can_id)) {
+      continue;
+    }
+    if (hightorque_node_id_from_can_id(can_id) == static_cast<uint8_t>(node_id)) {
+      ok = true;
+      break;
+    }
+  }
+  if (fd >= 0) {
+    ::close(fd);
+  }
+  return ok;
+}
+
+bool RealMixedRobotBackend::probe_yiyou_on_device(const std::string & device, int node_id)
+{
+  int fd = -1;
+  bool initialized = false;
+  if (!ensure_open("YiyouProbe", device, fd, initialized, {"C\r", "S8\r", "M0\r", "A1\r", "O\r"})) {
+    return false;
+  }
+  JointRoute route{};
+  route.node_id = node_id;
+  const std::string query = build_yiyou_read_query(route, 0x07);
+  uint64_t send_fail = 0;
+  uint64_t read_timeout = 0;
+  bool ok = false;
+  if (send_query("YiyouProbe", fd, query, send_fail, 1)) {
+    std::string raw;
+    if (read_raw_frame(fd, raw, read_timeout, "YiyouProbe", 1) && !raw.empty()) {
+      int32_t value = 0;
+      std::string reason;
+      ok = parse_yiyou_read_u32_reply(raw, 0x07, value, reason);
+    }
+  }
+  if (fd >= 0) {
+    ::close(fd);
+  }
+  return ok;
+}
+
+bool RealMixedRobotBackend::resolve_bridge_devices()
+{
+  const auto env_or_empty = [](const char * key) -> std::string {
+      if (const char * v = std::getenv(key)) {
+        if (std::strlen(v) > 0) {
+          return std::string(v);
+        }
+      }
+      return {};
+    };
+  const std::string ht_explicit = env_or_empty("ROBOT_ARM_HT_BRIDGE_DEVICE");
+  const std::string yy_explicit = env_or_empty("ROBOT_ARM_YIYOU_BRIDGE_DEVICE");
+  if (!ht_explicit.empty() && !yy_explicit.empty()) {
+    hightorque_channel_.bridge_device = ht_explicit;
+    yiyou_channel_.bridge_device = yy_explicit;
+    RCLCPP_INFO(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "bridge bind: explicit config hightorque=%s yiyou=%s",
+      hightorque_channel_.bridge_device.c_str(),
+      yiyou_channel_.bridge_device.c_str());
+    return true;
+  }
+
+  std::vector<std::string> candidates;
+  const auto push_unique = [&](const std::string & path) {
+      if (!path.empty() && std::filesystem::exists(path) &&
+        std::find(candidates.begin(), candidates.end(), path) == candidates.end())
+      {
+        candidates.push_back(path);
+      }
+    };
+  const auto collect_dir = [&](const std::string & dir) {
+      if (!std::filesystem::exists(dir)) {
+        return;
+      }
+      for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.is_symlink() || entry.is_character_file()) {
+          try {
+            push_unique(std::filesystem::canonical(entry.path()).string());
+          } catch (...) {
+            push_unique(entry.path().string());
+          }
+        }
+      }
+    };
+  collect_dir("/dev/serial/by-id");
+  collect_dir("/dev/serial/by-path");
+  for (const auto & entry : std::filesystem::directory_iterator("/dev")) {
+    const auto name = entry.path().filename().string();
+    if (name.rfind("ttyACM", 0) == 0) {
+      push_unique(entry.path().string());
+    }
+  }
+
+  std::set<int> ht_nodes;
+  for (const auto & route : hightorque_routes_) {
+    ht_nodes.insert(route.node_id);
+  }
+  int yy_node = 2;
+  for (const auto & route : yiyou_routes_) {
+    yy_node = route.node_id;
+    break;
+  }
+
+  std::string ht_found = ht_explicit;
+  std::string yy_found = yy_explicit;
+  RCLCPP_INFO(
+    rclcpp::get_logger("RealMixedRobotBackend"),
+    "bridge probe candidates=%zu explicit_ht=%s explicit_yiyou=%s",
+    candidates.size(),
+    ht_explicit.empty() ? "<none>" : ht_explicit.c_str(),
+    yy_explicit.empty() ? "<none>" : yy_explicit.c_str());
+
+  for (const auto & dev : candidates) {
+    if (ht_found.empty()) {
+      const bool ok = probe_hightorque_on_device(dev, ht_nodes);
+      RCLCPP_INFO(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "probe hightorque device=%s result=%s",
+        dev.c_str(),
+        ok ? "ok" : "fail");
+      if (ok) {
+        ht_found = dev;
+      }
+    }
+    if (yy_found.empty() && dev != ht_found) {
+      const bool ok = probe_yiyou_on_device(dev, yy_node);
+      RCLCPP_INFO(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "probe yiyou device=%s result=%s",
+        dev.c_str(),
+        ok ? "ok" : "fail");
+      if (ok) {
+        yy_found = dev;
+      }
+    }
+  }
+
+  if (ht_found.empty() || yy_found.empty() || ht_found == yy_found) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "bridge probe failed hightorque=%s yiyou=%s",
+      ht_found.empty() ? "<none>" : ht_found.c_str(),
+      yy_found.empty() ? "<none>" : yy_found.c_str());
+    return false;
+  }
+  hightorque_channel_.bridge_device = ht_found;
+  yiyou_channel_.bridge_device = yy_found;
+  RCLCPP_INFO(
+    rclcpp::get_logger("RealMixedRobotBackend"),
+    "bridge bind result: hightorque=%s yiyou=%s",
+    hightorque_channel_.bridge_device.c_str(),
+    yiyou_channel_.bridge_device.c_str());
+  return true;
+}
+
 bool RealMixedRobotBackend::sync_current_positions(std::vector<JointState> & states)
 {
-  // Non-blocking architectural rule:
-  // Do not perform synchronous serial IO in ros2_control activation path.
-  // Seed from cache/default and let background workers refresh real samples.
+  // Activation safety rule:
+  // HighTorque joints must have recent valid samples before activation succeeds.
+  start_polling_worker();
+
+  const auto t0 = std::chrono::steady_clock::now();
+  while (true) {
+    bool all_ready = true;
+    {
+      std::scoped_lock<std::mutex> lock(cache_mutex_);
+      for (const auto & route : hightorque_routes_) {
+        const auto it = last_good_time_sec_.find(route.joint_name);
+        if (it == last_good_time_sec_.end()) {
+          all_ready = false;
+          break;
+        }
+        const double age = now_monotonic_sec() - it->second;
+        if (age > sample_recency_window_sec_) {
+          all_ready = false;
+          break;
+        }
+      }
+    }
+    if (all_ready) {
+      break;
+    }
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+    if (elapsed_ms >= sync_wait_timeout_ms_) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "sync_current_positions: timeout waiting recent hightorque samples (%ldms)",
+        static_cast<long>(elapsed_ms));
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
   states.clear();
   states.reserve(routes_.size());
   {
     std::scoped_lock<std::mutex> lock(cache_mutex_);
     for (const auto & route : routes_) {
-      const auto it = latest_cache_.find(route.joint_name);
-      if (it != latest_cache_.end()) {
+      const auto it = last_good_cache_.find(route.joint_name);
+      if (it != last_good_cache_.end()) {
         states.push_back(it->second);
         last_command_position_[route.joint_name] = it->second.position;
         if (route.driver == "hightorque_canfd") {
@@ -1936,25 +2291,18 @@ bool RealMixedRobotBackend::sync_current_positions(std::vector<JointState> & sta
           hightorque_hold_ready_[route.joint_name] = it->second.available && it->second.online;
         }
       } else {
-        JointState fallback{};
-        fallback.available = false;
-        fallback.online = false;
-        fallback.stale = true;
-        fallback.source = "sync_default";
-        fallback.last_error = "no_cache_entry";
-        states.push_back(fallback);
-        last_command_position_[route.joint_name] = 0.0;
-        if (route.driver == "hightorque_canfd") {
-          hightorque_hold_targets_[route.joint_name] = 0.0;
-          hightorque_hold_ready_[route.joint_name] = false;
-        }
+        RCLCPP_ERROR(
+          rclcpp::get_logger("RealMixedRobotBackend"),
+          "sync_current_positions: missing last_good sample joint=%s driver=%s",
+          route.joint_name.c_str(),
+          route.driver.c_str());
+        return false;
       }
     }
   }
-  start_polling_worker();
   RCLCPP_INFO(
     rclcpp::get_logger("RealMixedRobotBackend"),
-    "sync_current_positions: seeded from cache/default, workers running in background");
+    "sync_current_positions: seeded from recent last_good samples");
   return true;
 }
 
@@ -1968,23 +2316,33 @@ bool RealMixedRobotBackend::read_all_joint_states(std::vector<JointState> & stat
   {
     std::scoped_lock<std::mutex> lock(cache_mutex_);
     for (const auto & route : routes_) {
-      const auto it = latest_cache_.find(route.joint_name);
-      if (it != latest_cache_.end()) {
-        JointState snapshot = it->second;
-        const double age_sec = now_monotonic_sec() - snapshot.last_update_time_sec;
-        if (snapshot.last_update_time_sec <= 0.0 || age_sec > 1.0) {
+      JointState snapshot{};
+      const auto good_it = last_good_cache_.find(route.joint_name);
+      const auto t_it = last_good_time_sec_.find(route.joint_name);
+      if (good_it != last_good_cache_.end() && t_it != last_good_time_sec_.end()) {
+        snapshot = good_it->second;
+        const double age_sec = now_monotonic_sec() - t_it->second;
+        if (age_sec <= sample_recency_window_sec_) {
+          snapshot.available = true;
+          snapshot.online = true;
+          snapshot.stale = false;
+          snapshot.last_error.clear();
+        } else {
+          snapshot.available = false;
+          snapshot.online = false;
           snapshot.stale = true;
+          snapshot.last_error = "last_good_stale";
         }
-        states.push_back(snapshot);
+        snapshot.last_update_time_sec = t_it->second;
+        snapshot.source = "last_good_cache";
       } else {
-        JointState fallback{};
-        fallback.available = false;
-        fallback.online = false;
-        fallback.stale = true;
-        fallback.source = "read_default";
-        fallback.last_error = "no_cache_entry";
-        states.push_back(fallback);
+        snapshot.available = false;
+        snapshot.online = false;
+        snapshot.stale = true;
+        snapshot.source = "read_default";
+        snapshot.last_error = "no_last_good_sample";
       }
+      states.push_back(snapshot);
     }
   }
 
@@ -2001,12 +2359,11 @@ bool RealMixedRobotBackend::read_all_joint_states(std::vector<JointState> & stat
 
 bool RealMixedRobotBackend::read_latest_position_turns(const std::string & joint_name, double & position_turns)
 {
-  std::scoped_lock<std::mutex> lock(cache_mutex_);
-  const auto it = latest_cache_.find(joint_name);
-  if (it == latest_cache_.end() || !it->second.available || !std::isfinite(it->second.position)) {
+  JointState state{};
+  if (!get_recent_last_good_state(joint_name, state, sample_recency_window_sec_)) {
     return false;
   }
-  position_turns = it->second.position;
+  position_turns = state.position;
   return true;
 }
 
@@ -2098,7 +2455,12 @@ bool RealMixedRobotBackend::send_yiyou_write_u32(
     ascii_escaped(query).c_str(),
     hex_digest(query).c_str());
 
-  if (!send_query("Yiyou", yiyou_channel_.fd, query, yiyou_channel_.send_failures, yiyou_channel_.read_attempts)) {
+  const bool drain_after_write =
+    !(semantic == "write_target_speed" || semantic == "write_target_position");
+  if (!send_query(
+      "Yiyou", yiyou_channel_.fd, query, yiyou_channel_.send_failures,
+      yiyou_channel_.read_attempts, drain_after_write))
+  {
     RCLCPP_ERROR(
       rclcpp::get_logger("RealMixedRobotBackend"),
       "[Yiyou][WRITE] semantic=%s joint=%s send failed",
@@ -2181,8 +2543,9 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
 
   bool has_motion_delta = false;
   constexpr double kCommandDeltaEpsTurns = 1e-4;
-  constexpr double kYiyouMoveDeadbandTurns = 2e-4;
+  constexpr double kVelocityHoldEps = 1e-4;
   bool fatal_error = false;
+  bool any_hightorque_step_command = false;
   uint64_t hightorque_enqueued = 0;
   uint64_t yiyou_write_count = 0;
   uint64_t yiyou_write_us = 0;
@@ -2213,36 +2576,95 @@ bool RealMixedRobotBackend::write_all_joint_commands(const std::vector<JointComm
       if (route.driver == "hightorque_canfd") {
         auto & desired = hightorque_desired_commands_[route.joint_name];
         desired.position_turns = target;
+        bool has_nonzero_velocity = false;
+        if (std::isfinite(commands[i].velocity)) {
+          desired.velocity_rps = commands[i].velocity;
+          has_nonzero_velocity = std::abs(commands[i].velocity) > kVelocityHoldEps;
+          desired.has_velocity = has_nonzero_velocity;
+        } else {
+          desired.velocity_rps = 0.0;
+          desired.has_velocity = false;
+          static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+          RCLCPP_DEBUG_THROTTLE(
+            rclcpp::get_logger("RealMixedRobotBackend"),
+            steady_clock,
+            2000,
+            "write_all_joint_commands: velocity fallback to 0 joint=%s",
+            route.joint_name.c_str());
+        }
         desired.stamp_sec = now_sec;
         desired.valid = true;
-        if (target_updated) {
-          hightorque_hold_targets_[route.joint_name] = target;
+        const bool is_step_command = target_updated || has_nonzero_velocity;
+        const bool joint_step_authorized = hightorque_allow_step_transition_ &&
+          (hightorque_step_authorized_.count(route.joint_name) ? hightorque_step_authorized_[route.joint_name] : false);
+        if (is_step_command) {
+          if (!joint_step_authorized) {
+            RCLCPP_INFO(
+              rclcpp::get_logger("RealMixedRobotBackend"),
+              "why_step_rejected_by_guard joint=%s delta_turns=%.6f vel_rps=%.6f source=write_command",
+              route.joint_name.c_str(),
+              std::abs(target - prev),
+              desired.velocity_rps);
+            desired.position_turns = hightorque_hold_targets_[route.joint_name];
+            desired.velocity_rps = 0.0;
+            desired.has_velocity = false;
+          } else {
+            any_hightorque_step_command = true;
+            hightorque_hold_targets_[route.joint_name] = target;
+            hightorque_last_step_command_sec_ = now_sec;
+            RCLCPP_INFO(
+              rclcpp::get_logger("RealMixedRobotBackend"),
+              "why_step_allowed joint=%s delta_turns=%.6f vel_rps=%.6f source=write_command",
+              route.joint_name.c_str(),
+              std::abs(target - prev),
+              desired.velocity_rps);
+          }
         }
         ++hightorque_enqueued;
       } else if (route.driver == "yiyou_can20a") {
-        if (std::abs(target - prev) > kYiyouMoveDeadbandTurns) {
-          const int32_t target_raw = static_cast<int32_t>(std::llround(target * 65536.0));
-          const auto t0 = std::chrono::steady_clock::now();
-          if (!send_yiyou_write_u32(route, 0x09, 0x00010000, "write_target_speed")) {
-            fatal_error = true;
-            break;
-          }
-          if (!send_yiyou_write_u32(route, 0x0A, target_raw, "write_target_position")) {
-            fatal_error = true;
-            break;
-          }
-          const auto t1 = std::chrono::steady_clock::now();
-          yiyou_write_us += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
-          ++yiyou_write_count;
-        }
+        std::scoped_lock<std::mutex> yy_lock(yiyou_tx_mutex_);
+        yiyou_desired_position_[route.joint_name] = target;
       }
 
       last_command_position_[route.joint_name] = target;
     }
+
+    constexpr double kStepToHoldIdleSec = 0.20;
+    if (hightorque_control_mode_ == HightorqueControlMode::DISABLED) {
+      hightorque_control_mode_ = HightorqueControlMode::HOLD_ACTIVE;
+    }
+    if (any_hightorque_step_command) {
+      if (hightorque_control_mode_ != HightorqueControlMode::STEP_MOVE_ACTIVE) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("RealMixedRobotBackend"),
+          "HIGHTORQUE_MODE transition HOLD_ACTIVE -> STEP_MOVE_ACTIVE");
+      }
+      hightorque_control_mode_ = HightorqueControlMode::STEP_MOVE_ACTIVE;
+    } else if (
+      hightorque_control_mode_ == HightorqueControlMode::STEP_MOVE_ACTIVE &&
+      (now_sec - hightorque_last_step_command_sec_) >= kStepToHoldIdleSec)
+    {
+      hightorque_control_mode_ = HightorqueControlMode::HOLD_ACTIVE;
+      RCLCPP_INFO(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "HIGHTORQUE_MODE transition STEP_MOVE_ACTIVE -> HOLD_ACTIVE idle_sec=%.3f",
+        now_sec - hightorque_last_step_command_sec_);
+      for (const auto & route : hightorque_routes_) {
+        auto it = hightorque_desired_commands_.find(route.joint_name);
+        if (it != hightorque_desired_commands_.end() && it->second.valid) {
+          hightorque_hold_targets_[route.joint_name] = it->second.position_turns;
+          RCLCPP_INFO(
+            rclcpp::get_logger("RealMixedRobotBackend"),
+            "HIGHTORQUE_HOLD_FREEZE joint=%s target_turns=%.6f source=executing_final_command",
+            route.joint_name.c_str(),
+            it->second.position_turns);
+        }
+      }
+    }
+    hightorque_tx_kick_ = true;
   }
 
-  hightorque_tx_cv_.notify_all();
+  hightorque_tx_cv_.notify_one();
 
   if (fatal_error) {
     faulted_ = true;
@@ -2280,6 +2702,9 @@ bool RealMixedRobotBackend::enable()
   faulted_ = false;
   hightorque_mode_log_once_ = false;
   hightorque_position_hold_active_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
+  hightorque_last_step_command_sec_ = 0.0;
   hightorque_hold_targets_.clear();
   hightorque_hold_ready_.clear();
 
@@ -2289,82 +2714,41 @@ bool RealMixedRobotBackend::enable()
     hightorque_command_family_.c_str(),
     hightorque_position_hold_active_ ? "active" : "inactive");
 
+  struct PendingSeed
+  {
+    JointRoute route;
+    double target_turns{0.0};
+    HightorqueMit2Config cfg{};
+  };
+  std::vector<PendingSeed> pending_seeds;
+  pending_seeds.reserve(hightorque_routes_.size());
+
+  // Phase A: verify all required HighTorque samples without sending any frame.
   for (const auto & route : routes_) {
     if (route.driver == "hightorque_canfd") {
-      std::string hold_target_source = "fallback";
-      double sampled_position_turns = 0.0;
-      double frozen_hold_target_turns = 0.0;
-      bool allow_enter_hold = false;
+      JointState sample{};
+      if (!get_recent_last_good_state(route.joint_name, sample, sample_recency_window_sec_) ||
+        !is_state_sample_good(sample))
       {
-        std::scoped_lock<std::mutex> lock(cache_mutex_);
-        const auto cache_it = latest_cache_.find(route.joint_name);
-        if (cache_it != latest_cache_.end()) {
-          sampled_position_turns = cache_it->second.position;
-          if (
-            cache_it->second.available && cache_it->second.online &&
-            std::isfinite(cache_it->second.position))
-          {
-            hold_target_source = "valid_sample";
-            frozen_hold_target_turns = cache_it->second.position;
-            allow_enter_hold = true;
-          } else {
-            hold_target_source = "default_cache";
-          }
-        }
-      }
-      if (!allow_enter_hold) {
-        hightorque_hold_ready_[route.joint_name] = false;
-        hightorque_hold_targets_.erase(route.joint_name);
-        RCLCPP_WARN(
+        RCLCPP_ERROR(
           rclcpp::get_logger("RealMixedRobotBackend"),
-          "HIGHTORQUE_HOLD_INIT joint=%s hold_target_source=%s sampled_position_turns=%.6f frozen_hold_target_turns=nan allow_enter_hold=false skip hold activation because no valid sample yet",
-          route.joint_name.c_str(),
-          hold_target_source.c_str(),
-          sampled_position_turns);
-        continue;
-      }
-
-      const auto cfg_it = hightorque_joint_mit2_config_.find(route.joint_name);
-      const auto & cfg = cfg_it != hightorque_joint_mit2_config_.end() ? cfg_it->second : hightorque_mit2_config_;
-      hightorque_hold_ready_[route.joint_name] = true;
-      hightorque_hold_targets_[route.joint_name] = frozen_hold_target_turns;
-      hightorque_last_sent_position_[route.joint_name] = frozen_hold_target_turns;
-      hightorque_last_send_time_sec_[route.joint_name] = now_monotonic_sec();
-      hightorque_filtered_velocity_[route.joint_name] = 0.0;
-      hightorque_last_velocity_target_[route.joint_name] = frozen_hold_target_turns;
-      hightorque_last_velocity_target_time_sec_[route.joint_name] = now_monotonic_sec();
-      {
-        std::scoped_lock<std::mutex> tx_lock(hightorque_tx_mutex_);
-        auto & desired = hightorque_desired_commands_[route.joint_name];
-        desired.position_turns = frozen_hold_target_turns;
-        desired.stamp_sec = now_monotonic_sec();
-        desired.valid = true;
-      }
-
-      RCLCPP_INFO(
-        rclcpp::get_logger("RealMixedRobotBackend"),
-        "HIGHTORQUE_HOLD_INIT joint=%s hold_target_source=%s sampled_position_turns=%.6f frozen_hold_target_turns=%.6f allow_enter_hold=true kp=%.3f kd=%.3f tqe_nm=%.3f",
-        route.joint_name.c_str(),
-        hold_target_source.c_str(),
-        sampled_position_turns,
-        frozen_hold_target_turns,
-        cfg.kp,
-        cfg.kd,
-        cfg.tqe_nm);
-
-      const std::string hold_frame =
-        LegacyProtocolDeviceActions::hightorque_move_position_target(
-          route,
-          frozen_hold_target_turns,
-          0.0,
-          cfg.tqe_nm,
-          cfg.kp,
-          cfg.kd,
-          cfg.model);
-      if (!send_hightorque_action(route, "mit2_enable_hold_seed", hold_frame, false)) {
-        faulted_ = true;
+          "HIGHTORQUE_ENABLE_REJECT joint=%s reason=no_recent_valid_sample",
+          route.joint_name.c_str());
+        enabled_ = false;
+        hightorque_position_hold_active_ = false;
         return false;
       }
+      const auto cfg_it = hightorque_joint_mit2_config_.find(route.joint_name);
+      const auto & cfg = cfg_it != hightorque_joint_mit2_config_.end() ? cfg_it->second : hightorque_mit2_config_;
+      const double age_sec = now_monotonic_sec() - sample.last_update_time_sec;
+      RCLCPP_INFO(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "HIGHTORQUE_ENABLE_SAMPLE joint=%s sample_ok=true sample_age_sec=%.4f pos_turns=%.6f vel=%.6f",
+        route.joint_name.c_str(),
+        age_sec,
+        sample.position,
+        sample.velocity);
+      pending_seeds.push_back(PendingSeed{route, sample.position, cfg});
       continue;
     }
     if (route.driver == "yiyou_can20a") {
@@ -2375,7 +2759,46 @@ bool RealMixedRobotBackend::enable()
     }
   }
 
+  // Phase B: all HighTorque joints passed verification, now seed and activate.
+  for (const auto & seed : pending_seeds) {
+    hightorque_hold_ready_[seed.route.joint_name] = true;
+    hightorque_hold_targets_[seed.route.joint_name] = seed.target_turns;
+    hightorque_last_sent_position_[seed.route.joint_name] = seed.target_turns;
+    hightorque_last_send_time_sec_[seed.route.joint_name] = now_monotonic_sec();
+    hightorque_filtered_velocity_[seed.route.joint_name] = 0.0;
+    hightorque_last_velocity_target_[seed.route.joint_name] = seed.target_turns;
+    hightorque_last_velocity_target_time_sec_[seed.route.joint_name] = now_monotonic_sec();
+    {
+      std::scoped_lock<std::mutex> tx_lock(hightorque_tx_mutex_);
+      auto & desired = hightorque_desired_commands_[seed.route.joint_name];
+      desired.position_turns = seed.target_turns;
+      desired.velocity_rps = 0.0;
+      desired.has_velocity = false;
+      desired.stamp_sec = now_monotonic_sec();
+      desired.valid = true;
+    }
+    RCLCPP_INFO(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "HIGHTORQUE_HOLD_INIT joint=%s hold_target_source=valid_sample frozen_hold_target_turns=%.6f kp=%.3f kd=%.3f tqe_nm=%.3f",
+      seed.route.joint_name.c_str(),
+      seed.target_turns,
+      seed.cfg.kp,
+      seed.cfg.kd,
+      seed.cfg.tqe_nm);
+
+    const std::string hold_frame = LegacyProtocolDeviceActions::hightorque_move_position_target(
+      seed.route, seed.target_turns, 0.0, seed.cfg.tqe_nm, seed.cfg.kp, seed.cfg.kd, seed.cfg.model);
+    if (!send_hightorque_action(seed.route, "mit2_enable_hold_seed", hold_frame, false)) {
+      faulted_ = true;
+      enabled_ = false;
+      hightorque_position_hold_active_ = false;
+      return false;
+    }
+  }
+
   hightorque_position_hold_active_ = true;
+  hightorque_control_mode_ = HightorqueControlMode::HOLD_ACTIVE;
+  hightorque_allow_step_transition_ = false;
   enabled_ = true;
   hightorque_tx_cv_.notify_all();
   return true;
@@ -2384,6 +2807,9 @@ bool RealMixedRobotBackend::enable()
 bool RealMixedRobotBackend::disable()
 {
   hightorque_position_hold_active_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
+  hightorque_last_step_command_sec_ = 0.0;
   hightorque_tx_cv_.notify_all();
   for (const auto & route : routes_) {
     if (route.driver == "hightorque_canfd") {
@@ -2424,6 +2850,8 @@ bool RealMixedRobotBackend::stop()
     }
   }
   enabled_ = false;
+  hightorque_control_mode_ = HightorqueControlMode::DISABLED;
+  hightorque_allow_step_transition_ = false;
   faulted_ = true;
   return ok;
 }
@@ -2434,6 +2862,83 @@ bool RealMixedRobotBackend::clear_fault()
   return true;
 }
 
+void RealMixedRobotBackend::set_hold_seed_snapshot(
+  const std::vector<JointCommand> & commands, const std::string & source)
+{
+  if (commands.size() != routes_.size()) {
+    RCLCPP_WARN(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "set_hold_seed_snapshot: ignored size mismatch commands=%zu routes=%zu source=%s",
+      commands.size(),
+      routes_.size(),
+      source.c_str());
+    return;
+  }
+  std::scoped_lock<std::mutex> tx_lock(hightorque_tx_mutex_);
+  for (size_t i = 0; i < routes_.size(); ++i) {
+    const auto & route = routes_[i];
+    if (route.driver != "hightorque_canfd") {
+      continue;
+    }
+    const double seed = commands[i].position;
+    const double prev_hold = hightorque_hold_targets_.count(route.joint_name) ?
+      hightorque_hold_targets_[route.joint_name] : seed;
+    if (std::abs(prev_hold - seed) > 1e-4) {
+      RCLCPP_WARN(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        "ENABLE_SEED_MISMATCH joint=%s old_hold_turns=%.6f new_seed_turns=%.6f source=%s",
+        route.joint_name.c_str(),
+        prev_hold,
+        seed,
+        source.c_str());
+    }
+    last_command_position_[route.joint_name] = seed;
+    hightorque_hold_targets_[route.joint_name] = seed;
+    auto & desired = hightorque_desired_commands_[route.joint_name];
+    desired.position_turns = seed;
+    desired.velocity_rps = 0.0;
+    desired.has_velocity = false;
+    desired.stamp_sec = now_monotonic_sec();
+    desired.valid = true;
+    RCLCPP_INFO(
+      rclcpp::get_logger("RealMixedRobotBackend"),
+      "BACKEND_ENABLE_SEED_SYNC joint=%s backend_turns=%.6f source=%s",
+      route.joint_name.c_str(),
+      seed,
+      source.c_str());
+  }
+}
+
+void RealMixedRobotBackend::set_step_transition_enabled(bool enabled, const std::string & reason)
+{
+  if (hightorque_allow_step_transition_ == enabled) {
+    return;
+  }
+  hightorque_allow_step_transition_ = enabled;
+  RCLCPP_INFO(
+    rclcpp::get_logger("RealMixedRobotBackend"),
+    "HIGHTORQUE_STEP_TRANSITION %s reason=%s",
+    enabled ? "enabled" : "disabled",
+    reason.c_str());
+}
+
+void RealMixedRobotBackend::set_step_transition_for_joint(
+  const std::string & joint_name, bool enabled, const std::string & reason)
+{
+  const bool prev = hightorque_step_authorized_.count(joint_name) ?
+    hightorque_step_authorized_[joint_name] : false;
+  if (prev == enabled) {
+    return;
+  }
+  hightorque_step_authorized_[joint_name] = enabled;
+  RCLCPP_INFO(
+    rclcpp::get_logger("RealMixedRobotBackend"),
+    "step authorization state changed joint=%s enabled=%s reason=%s",
+    joint_name.c_str(),
+    enabled ? "true" : "false",
+    reason.c_str());
+}
+
 RealMixedRobotBackend::~RealMixedRobotBackend()
 {
   stop_polling_worker();
@@ -2442,6 +2947,24 @@ RealMixedRobotBackend::~RealMixedRobotBackend()
 bool RealMixedRobotBackend::discover_hightorque_joints()
 {
   return hightorque_channel_.discover(routes_, discovered_);
+}
+
+bool RealMixedRobotBackend::get_recent_last_good_state(
+  const std::string & joint_name, JointState & out_state, double max_age_sec)
+{
+  std::scoped_lock<std::mutex> lock(cache_mutex_);
+  const auto it = last_good_cache_.find(joint_name);
+  const auto t_it = last_good_time_sec_.find(joint_name);
+  if (it == last_good_cache_.end() || t_it == last_good_time_sec_.end()) {
+    return false;
+  }
+  const double age = now_monotonic_sec() - t_it->second;
+  if (age > max_age_sec) {
+    return false;
+  }
+  out_state = it->second;
+  out_state.last_update_time_sec = t_it->second;
+  return true;
 }
 
 bool RealMixedRobotBackend::discover_yiyou_joints()
@@ -2496,36 +3019,52 @@ void RealMixedRobotBackend::polling_loop_hightorque()
     const bool armed_poll = enabled_.load();
     size_t begin_idx = 0;
     size_t end_idx = hightorque_routes_.size();
-    if (armed_poll && !hightorque_routes_.empty()) {
-      begin_idx = static_cast<size_t>(cycle % hightorque_routes_.size());
-      end_idx = begin_idx + 1;
-    }
 
     for (size_t idx = begin_idx; idx < end_idx; ++idx) {
       const auto & route = hightorque_routes_[idx];
       JointState state{};
       const bool ok = hightorque_channel_.read_joint(route, state);
-      if (ok && state.available) {
-        hightorque_channel_.latest_states[route.joint_name] = state;
-        state.stale = false;
-        state.last_error.clear();
-      } else {
-        const auto cached = hightorque_channel_.latest_states.find(route.joint_name);
-        if (cached != hightorque_channel_.latest_states.end()) {
-          state = cached->second;
-          state.available = false;
-          state.online = false;
-          state.stale = true;
-          state.last_error = "hightorque_timeout_or_no_response";
+      const double now_sec = now_monotonic_sec();
+      state.last_update_time_sec = now_sec;
+      state.source = "hightorque_worker_latest_poll";
+
+      {
+        std::scoped_lock<std::mutex> lock(cache_mutex_);
+        latest_poll_result_[route.joint_name] = state;
+        if (ok && state.available && state.online && std::isfinite(state.position) && std::isfinite(state.velocity)) {
+          JointState good = state;
+          good.stale = false;
+          good.last_error.clear();
+          good.source = "hightorque_worker_last_good";
+          last_good_cache_[route.joint_name] = good;
+          last_good_time_sec_[route.joint_name] = now_sec;
+          latest_cache_[route.joint_name] = good;
+          hightorque_channel_.latest_states[route.joint_name] = good;
         } else {
-          state.available = false;
-          state.online = false;
-          state.stale = true;
-          state.last_error = "hightorque_no_sample";
+          const auto good_it = last_good_cache_.find(route.joint_name);
+          const auto t_it = last_good_time_sec_.find(route.joint_name);
+          if (good_it != last_good_cache_.end() && t_it != last_good_time_sec_.end()) {
+            JointState snapshot = good_it->second;
+            const double age = now_sec - t_it->second;
+            snapshot.available = age <= sample_recency_window_sec_;
+            snapshot.online = snapshot.available;
+            snapshot.stale = !snapshot.available;
+            snapshot.last_error = snapshot.available ? "" : "last_good_stale";
+            snapshot.last_update_time_sec = t_it->second;
+            snapshot.source = "hightorque_worker_last_good_snapshot";
+            latest_cache_[route.joint_name] = snapshot;
+          } else {
+            JointState missing{};
+            missing.available = false;
+            missing.online = false;
+            missing.stale = true;
+            missing.last_error = "hightorque_no_sample";
+            missing.last_update_time_sec = now_sec;
+            missing.source = "hightorque_worker_no_sample";
+            latest_cache_[route.joint_name] = missing;
+          }
         }
       }
-      state.last_update_time_sec = now_monotonic_sec();
-      state.source = "hightorque_worker";
 
       if (!ok && !faulted_) {
         RCLCPP_WARN(
@@ -2538,14 +3077,16 @@ void RealMixedRobotBackend::polling_loop_hightorque()
     if (cycle % 100 == 0) {
       RCLCPP_INFO(
         rclcpp::get_logger("RealMixedRobotBackend"),
-        "polling_loop_hightorque: mode=%s cycle=%lu refreshed=%zu/%zu joints (decimation=%s)",
-        armed_poll ? "ARMED poll" : "UNARMED poll",
+        "polling_loop_hightorque: mode=%s cycle=%lu refreshed=%zu/%zu joints (round_robin=%s period_ms=%d)",
+        armed_poll ? "ARMED poll_all" : "UNARMED poll_all",
         static_cast<unsigned long>(cycle),
-        armed_poll ? static_cast<size_t>(1) : hightorque_routes_.size(),
         hightorque_routes_.size(),
-        armed_poll ? "enabled skip poll(all->round_robin_1)" : "none");
+        hightorque_routes_.size(),
+        "disabled",
+        armed_poll ? hightorque_poll_period_ms_armed_ : hightorque_poll_period_ms_unarmed_);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(armed_poll ? 20 : 10));
+    std::this_thread::sleep_for(
+      std::chrono::milliseconds(armed_poll ? hightorque_poll_period_ms_armed_ : hightorque_poll_period_ms_unarmed_));
   }
 }
 
@@ -2553,29 +3094,89 @@ void RealMixedRobotBackend::polling_loop_hightorque()
 void RealMixedRobotBackend::hightorque_tx_loop()
 {
   uint64_t cycle = 0;
+  auto next_deadline = std::chrono::steady_clock::now();
+  bool has_last_send = false;
+  auto last_send_tp = std::chrono::steady_clock::now();
+  double accum_period_ms = 0.0;
+  uint64_t period_samples = 0;
+
   while (hightorque_tx_running_.load()) {
     ++cycle;
 
-    std::unique_lock<std::mutex> lk(hightorque_tx_mutex_);
     int period_ms = hightorque_mit2_config_.write_period_ms;
-    for (const auto & item : hightorque_joint_mit2_config_) {
-      period_ms = std::min(period_ms, item.second.write_period_ms);
+    {
+      std::scoped_lock<std::mutex> lk(hightorque_tx_mutex_);
+      for (const auto & item : hightorque_joint_mit2_config_) {
+        period_ms = std::min(period_ms, item.second.write_period_ms);
+      }
     }
     period_ms = std::max(5, period_ms);
-    hightorque_tx_cv_.wait_for(
-      lk,
-      std::chrono::milliseconds(period_ms),
-      [this]() {return !hightorque_tx_running_.load() || !polling_running_.load() || enabled_.load();});
+    if (cycle == 1) {
+      next_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(period_ms);
+    } else {
+      next_deadline += std::chrono::milliseconds(period_ms);
+      const auto now = std::chrono::steady_clock::now();
+      if (now > next_deadline + std::chrono::milliseconds(2 * period_ms)) {
+        next_deadline = now + std::chrono::milliseconds(period_ms);
+      }
+    }
+
+    bool wake_by_command = false;
+    while (hightorque_tx_running_.load() && polling_running_.load()) {
+      std::unique_lock<std::mutex> lk(hightorque_tx_mutex_);
+      const bool woke = hightorque_tx_cv_.wait_until(
+        lk,
+        next_deadline,
+        [this]() {return !hightorque_tx_running_.load() || !polling_running_.load() || hightorque_tx_kick_;});
+      if (!hightorque_tx_running_.load() || !polling_running_.load()) {
+        break;
+      }
+      if (woke && hightorque_tx_kick_) {
+        ++hightorque_tx_wakeup_command_;
+        hightorque_tx_kick_ = false;
+        wake_by_command = true;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_deadline) {
+          static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+          RCLCPP_INFO_THROTTLE(
+            rclcpp::get_logger("RealMixedRobotBackend"),
+            steady_clock,
+            500,
+            "hightorque_tx_loop: wake_by=command_update deferred_until_period remaining_ms=%.3f",
+            std::chrono::duration<double, std::milli>(next_deadline - now).count());
+          continue;
+        }
+      } else {
+        ++hightorque_tx_wakeup_periodic_;
+      }
+      break;
+    }
 
     if (!hightorque_tx_running_.load() || !polling_running_.load()) {
       break;
     }
+    if (wake_by_command) {
+      static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+      RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        steady_clock,
+        500,
+        "hightorque_tx_loop: wake_by=command_update at_period_boundary");
+    } else {
+      static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+      RCLCPP_DEBUG_THROTTLE(
+        rclcpp::get_logger("RealMixedRobotBackend"),
+        steady_clock,
+        500,
+        "hightorque_tx_loop: wake_by=periodic");
+    }
 
+    std::unique_lock<std::mutex> lk(hightorque_tx_mutex_);
     std::vector<std::tuple<JointRoute, HightorqueDesiredCommand, HightorqueMit2Config>> jobs;
     jobs.reserve(hightorque_routes_.size());
     for (const auto & route : hightorque_routes_) {
       const bool hold_ready = hightorque_hold_ready_[route.joint_name];
-      if (!enabled_.load() || !hightorque_position_hold_active_ || !hold_ready) {
+      if (!enabled_.load() || !hold_ready || hightorque_control_mode_ == HightorqueControlMode::DISABLED) {
         continue;
       }
 
@@ -2585,8 +3186,16 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         desired = desired_it->second;
       } else {
         desired.position_turns = hightorque_hold_targets_[route.joint_name];
+        desired.velocity_rps = 0.0;
+        desired.has_velocity = false;
         desired.stamp_sec = now_monotonic_sec();
         desired.valid = true;
+      }
+      const bool use_hold_target = (hightorque_control_mode_ == HightorqueControlMode::HOLD_ACTIVE);
+      if (use_hold_target) {
+        desired.position_turns = hightorque_hold_targets_[route.joint_name];
+        desired.velocity_rps = 0.0;
+        desired.has_velocity = false;
       }
       const auto cfg_it = hightorque_joint_mit2_config_.find(route.joint_name);
       const auto cfg = cfg_it != hightorque_joint_mit2_config_.end() ? cfg_it->second : hightorque_mit2_config_;
@@ -2599,14 +3208,15 @@ void RealMixedRobotBackend::hightorque_tx_loop()
       const auto & route = std::get<0>(job);
       const auto & desired = std::get<1>(job);
       const auto & cfg = std::get<2>(job);
+      const bool hold_mode = (hightorque_control_mode_ == HightorqueControlMode::HOLD_ACTIVE);
 
       const double prev_target = hightorque_last_velocity_target_.count(route.joint_name) ?
         hightorque_last_velocity_target_[route.joint_name] : desired.position_turns;
       const double prev_target_t = hightorque_last_velocity_target_time_sec_.count(route.joint_name) ?
         hightorque_last_velocity_target_time_sec_[route.joint_name] : desired.stamp_sec;
 
-      double raw_vel = 0.0;
-      if (desired.stamp_sec > prev_target_t + 1e-6) {
+      double raw_vel = desired.has_velocity ? desired.velocity_rps : 0.0;
+      if (!desired.has_velocity && desired.stamp_sec > prev_target_t + 1e-6) {
         raw_vel = (desired.position_turns - prev_target) / std::max(0.001, desired.stamp_sec - prev_target_t);
       }
       const double vel_limit = std::max(0.1, cfg.max_velocity_rps);
@@ -2634,7 +3244,7 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         cfg.model);
 
       const auto t0 = std::chrono::steady_clock::now();
-      if (!send_hightorque_action(route, "mit2_servo_cycle", frame, false)) {
+      if (!send_hightorque_action(route, hold_mode ? "hold_current_position" : "mit2_servo_cycle", frame, false)) {
         faulted_ = true;
         continue;
       }
@@ -2650,23 +3260,49 @@ void RealMixedRobotBackend::hightorque_tx_loop()
         rclcpp::get_logger("RealMixedRobotBackend"),
         steady_clock,
         500,
-        "HIGHTORQUE_MIT2_SERVO joint=%s target_turns=%.6f vel_feed_rps=%.6f kp=%.3f kd=%.3f tqe_nm=%.3f period_ms=%d",
+        "HIGHTORQUE_MIT2_SERVO joint=%s target_turns=%.6f vel_feed_rps=%.6f vel_src=%s kp=%.3f kd=%.3f tqe_nm=%.3f period_ms=%d",
         route.joint_name.c_str(),
         desired.position_turns,
         hightorque_filtered_velocity_[route.joint_name],
+        hold_mode ? "hold_zero" : (desired.has_velocity ? "controller" : "position_diff_fallback"),
         cfg.kp,
         cfg.kd,
         cfg.tqe_nm,
         cfg.write_period_ms);
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (has_last_send) {
+      const double dt_ms = std::chrono::duration<double, std::milli>(now - last_send_tp).count();
+      accum_period_ms += dt_ms;
+      ++period_samples;
+    }
+    last_send_tp = now;
+    has_last_send = true;
+
     if (cycle % 100 == 0) {
+      const double avg_period_ms = period_samples > 0 ? (accum_period_ms / static_cast<double>(period_samples)) : 0.0;
+      const double tx_hz = avg_period_ms > 1e-6 ? (1000.0 / avg_period_ms) : 0.0;
+      const double per_joint_hz = tx_hz;
+      const char * mode = "DISABLED";
+      if (hightorque_control_mode_ == HightorqueControlMode::HOLD_ACTIVE) {
+        mode = "HOLD_ACTIVE";
+      } else if (hightorque_control_mode_ == HightorqueControlMode::STEP_MOVE_ACTIVE) {
+        mode = "STEP_MOVE_ACTIVE";
+      }
       RCLCPP_INFO(
         rclcpp::get_logger("RealMixedRobotBackend"),
-        "hightorque_tx_loop: cycle=%lu jobs=%zu total_us=%lu",
+        "hightorque_tx_loop: cycle=%lu mode=%s jobs=%zu total_us=%lu configured_period_ms=%d avg_period_ms=%.3f tx_hz=%.2f per_joint_hz=%.2f wake_periodic=%lu wake_command=%lu",
         static_cast<unsigned long>(cycle),
+        mode,
         jobs.size(),
-        static_cast<unsigned long>(cycle_us));
+        static_cast<unsigned long>(cycle_us),
+        period_ms,
+        avg_period_ms,
+        tx_hz,
+        per_joint_hz,
+        static_cast<unsigned long>(hightorque_tx_wakeup_periodic_),
+        static_cast<unsigned long>(hightorque_tx_wakeup_command_));
     }
   }
 }
@@ -2697,6 +3333,12 @@ void RealMixedRobotBackend::polling_loop_yiyou()
         yiyou_channel_.latest_joint2_state = state;
         state.stale = false;
         state.last_error.clear();
+        {
+          std::scoped_lock<std::mutex> lock(cache_mutex_);
+          latest_poll_result_[route.joint_name] = state;
+          last_good_cache_[route.joint_name] = state;
+          last_good_time_sec_[route.joint_name] = now_monotonic_sec();
+        }
       } else {
         if (yiyou_channel_.latest_joint2_state.has_value()) {
           state = *yiyou_channel_.latest_joint2_state;
@@ -2715,8 +3357,73 @@ void RealMixedRobotBackend::polling_loop_yiyou()
       }
       state.last_update_time_sec = now_monotonic_sec();
       state.source = "yiyou_worker";
+      {
+        std::scoped_lock<std::mutex> lock(cache_mutex_);
+        latest_poll_result_[route.joint_name] = state;
+        if (!is_state_sample_good(state)) {
+          const auto good_it = last_good_cache_.find(route.joint_name);
+          const auto t_it = last_good_time_sec_.find(route.joint_name);
+          if (good_it != last_good_cache_.end() && t_it != last_good_time_sec_.end()) {
+            JointState snapshot = good_it->second;
+            const double age = now_monotonic_sec() - t_it->second;
+            snapshot.available = age <= sample_recency_window_sec_;
+            snapshot.online = snapshot.available;
+            snapshot.stale = !snapshot.available;
+            snapshot.last_error = snapshot.available ? "" : "last_good_stale";
+            snapshot.last_update_time_sec = t_it->second;
+            snapshot.source = "yiyou_worker_last_good_snapshot";
+            latest_cache_[route.joint_name] = snapshot;
+          } else {
+            latest_cache_[route.joint_name] = state;
+          }
+        } else {
+          latest_cache_[route.joint_name] = state;
+        }
+      }
 
-      write_cache_locked(route.joint_name, state);
+      if (enabled_.load() && route.driver == "yiyou_can20a") {
+        constexpr double kYiyouSendDeadbandTurns = 2e-4;
+        constexpr double kYiyouSendMinPeriodSec = 0.02;
+        double target = std::numeric_limits<double>::quiet_NaN();
+        {
+          std::scoped_lock<std::mutex> yy_lock(yiyou_tx_mutex_);
+          const auto it = yiyou_desired_position_.find(route.joint_name);
+          if (it != yiyou_desired_position_.end()) {
+            target = it->second;
+          }
+        }
+        if (std::isfinite(target)) {
+          const double now_sec = now_monotonic_sec();
+          const double last_sent = yiyou_last_sent_position_.count(route.joint_name) ?
+            yiyou_last_sent_position_[route.joint_name] : target;
+          const double last_send_t = yiyou_last_send_time_sec_.count(route.joint_name) ?
+            yiyou_last_send_time_sec_[route.joint_name] : 0.0;
+          const bool need_send = std::abs(target - last_sent) > kYiyouSendDeadbandTurns &&
+            (now_sec - last_send_t) >= kYiyouSendMinPeriodSec;
+          if (need_send) {
+            const int32_t target_raw = static_cast<int32_t>(std::llround(target * 65536.0));
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok_speed = send_yiyou_write_u32(route, 0x09, 0x00010000, "write_target_speed");
+            const bool ok_pos = ok_speed && send_yiyou_write_u32(route, 0x0A, target_raw, "write_target_position");
+            const auto t1 = std::chrono::steady_clock::now();
+            const auto dur_us = static_cast<unsigned long>(
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+            RCLCPP_INFO_THROTTLE(
+              rclcpp::get_logger("RealMixedRobotBackend"),
+              *new rclcpp::Clock(RCL_STEADY_TIME),
+              500,
+              "YIYOU_ASYNC_WRITE joint=%s target=%.6f us=%lu result=%s",
+              route.joint_name.c_str(),
+              target,
+              dur_us,
+              ok_pos ? "ok" : "fail");
+            if (ok_pos) {
+              yiyou_last_sent_position_[route.joint_name] = target;
+              yiyou_last_send_time_sec_[route.joint_name] = now_sec;
+            }
+          }
+        }
+      }
     }
     if (cycle % 100 == 0) {
       RCLCPP_INFO(

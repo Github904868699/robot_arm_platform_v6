@@ -22,7 +22,9 @@ arm_controller:
       - joint_5
       - joint_6
     command_interfaces:
+      # C-lite: explicit position + velocity command interfaces.
       - position
+      - velocity
     state_interfaces:
       - position
       - velocity

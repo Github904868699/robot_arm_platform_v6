@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "hardware_interface/system_interface.hpp"
@@ -68,6 +69,7 @@ private:
   void teardown_backend_services();
   void spin_backend_services();
   void set_hold_targets_from_current();
+  bool wait_for_stable_samples_before_enable();
   bool load_routing();
 
   // Upper layers only see logical joints: joint_1 ~ joint_6.
@@ -78,7 +80,9 @@ private:
   std::vector<std::string> joint_names_;
   std::vector<double> hw_positions_;
   std::vector<double> hw_velocities_;
-  std::vector<double> hw_commands_;
+  // C-lite command cache: keep position/velocity command buffers separately.
+  std::vector<double> hw_position_commands_;
+  std::vector<double> hw_velocity_commands_;
   std::vector<double> hold_targets_;
 
   RuntimeState runtime_state_{RuntimeState::DISCOVERING};
@@ -87,6 +91,16 @@ private:
   std::string joint_mapping_path_{};
   bool auto_enable_on_activate_{false};
   double auto_enable_delay_sec_{1.0};
+  double hold_guard_window_sec_{0.6};
+  double exec_enter_pos_threshold_rad_{0.003};
+  double exec_enter_vel_threshold_rad_s_{0.02};
+  int exec_enter_required_cycles_{3};
+  int exec_motion_candidate_cycles_{0};
+  double hold_guard_until_sec_{0.0};
+  bool backend_step_transition_enabled_{false};
+  std::unordered_map<std::string, bool> backend_joint_step_authorized_;
+  int enable_min_stable_cycles_{3};
+  int enable_wait_timeout_ms_{1500};
 
   rclcpp::Node::SharedPtr backend_service_node_;
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> backend_service_executor_;
